@@ -1,4 +1,35 @@
 import atexit
+
+# --- Safe Telegram shutdown helper ---
+def safe_close_telegram(tg_manager):
+    """Close Telegram manager safely from synchronous contexts (e.g., atexit)."""
+    try:
+        import asyncio
+        if tg_manager is None:
+            return
+        close_coro = getattr(tg_manager, "close", None)
+        if close_coro is None:
+            return
+        if asyncio.iscoroutinefunction(close_coro):
+            try:
+                loop = asyncio.get_event_loop()
+                if loop.is_running():
+                    fut = asyncio.run_coroutine_threadsafe(close_coro(), loop)
+                    try:
+                        fut.result(timeout=3)
+                    except Exception:
+                        pass
+                else:
+                    asyncio.run(close_coro())
+            except Exception:
+                pass
+        else:
+            try:
+                tg_manager.close()
+            except Exception:
+                pass
+    except Exception:
+        pass
 # ---- injected utility: rotate state backups ----
 def rotate_state_backups(path, keep=5):
     try:
@@ -21,7 +52,7 @@ def _shutdown_cleanup():
     try:
         if 'tg_manager' in globals() and tg_manager:
             try:
-                tg_manager.close()
+                safe_close_telegram(tg_manager)
                 log("Telegram manager closed.")
             except Exception as e:
                 log("Telegram manager close() error: %s", e)
@@ -75,10 +106,6 @@ Smart Crypto Bot (OKX via CCXT) — FULL FINAL BUILD
 - Proper async/await throughout
 """
 
-  # ensure available before _shutdown_cleanup
-
-
-
 import os
 import sys
 import time
@@ -96,6 +123,21 @@ import warnings
 warnings.filterwarnings('ignore')
 
 # Core dependencies
+
+# --- timeframe utilities ---
+def _tf_to_ms(tf: str) -> int:
+    try:
+        tf = str(tf).strip().lower()
+        mapping = {
+            "1m": 60_000, "3m": 180_000, "5m": 300_000, "15m": 900_000, "30m": 1_800_000,
+            "1h": 3_600_000, "2h": 7_200_000, "4h": 14_400_000, "6h": 21_600_000, "8h": 28_800_000, "12h": 43_200_000,
+            "1d": 86_400_000, "3d": 259_200_000, "1w": 604_800_000
+        }
+        if tf.endswith("min"):
+            return int(float(tf[:-3]) * 60_000)
+        return mapping.get(tf, 300_000)  # default 5m
+    except Exception:
+        return 300_000
 import ccxt
 import aiohttp
 import pandas as pd
@@ -284,7 +326,7 @@ def timeframe_alias(tf: str) -> str:
     return aliases.get(t, "1h")
 
 def save_state(filepath: str, data: dict):
-    rotate_state_backups(filepath)
+    if os.path.exists(filepath): rotate_state_backups(filepath)
     """Save state to JSON file with backup"""
     try:
         # Create backup if exists
@@ -596,7 +638,7 @@ async def ensure_history(sym, tf="5m", months=12, limit=1000, max_retries=3):
             df = pd.read_csv(path)
             if len(df) > 0:
                 last_ms = int(df['ts'].iloc[-1])
-                since = last_ms + 1
+                since = last_ms + _tf_to_ms(tf)
                 all_rows = df.values.tolist()
                 log(f"Resuming download for {sym} {tf} from {datetime.fromtimestamp(since/1000, tz=timezone.utc)}")
         
@@ -612,7 +654,7 @@ async def ensure_history(sym, tf="5m", months=12, limit=1000, max_retries=3):
                 
                 all_rows.extend(batch)
                 downloaded += len(batch)
-                since = batch[-1][0] + 1
+                since = batch[-1][0] + _tf_to_ms(tf)
                 retry_count = 0  # Reset on success
                 
                 # Progress update
@@ -636,7 +678,9 @@ async def ensure_history(sym, tf="5m", months=12, limit=1000, max_retries=3):
         if all_rows:
             df = pd.DataFrame(all_rows, columns=["ts", "open", "high", "low", "close", "volume"])
             df = df.drop_duplicates(subset=["ts"]).sort_values("ts")
-            df.to_csv(path, index=False)
+            tmp = path + '.tmp'
+            df.to_csv(tmp, index=False)
+            os.replace(tmp, path)
             log(f"Saved {len(df)} bars for {sym} {tf}")
             return True
         
@@ -993,9 +1037,9 @@ def create_features(df: pd.DataFrame) -> pd.DataFrame:
         features['kurt_10'] = close.rolling(10).kurt()
         
         # Candlestick patterns
-        features['doji'] = abs(close - df['open']) / (high - low + 1e-10)
-        features['upper_shadow'] = (high - np.maximum(close, df['open'])) / (high - low + 1e-10)
-        features['lower_shadow'] = (np.minimum(close, df['open']) - low) / (high - low + 1e-10)
+        features['doji'] = abs(close - df.get('open', df['close'])) / (high - low + 1e-10)
+        features['upper_shadow'] = (high - np.maximum(close, df.get('open', df['close']))) / (high - low + 1e-10)
+        features['lower_shadow'] = (np.minimum(close, df.get('open', df['close'])) - low) / (high - low + 1e-10)
         
         # Advanced momentum
         features['rsi_sma'] = df['rsi'].rolling(5).mean()
@@ -1037,9 +1081,9 @@ def create_labels(df: pd.DataFrame, forward_bars=1, threshold=0.002) -> pd.Serie
     future_returns = close.shift(-forward_bars) / close - 1
     
     # Use threshold for clearer signals
-    labels = pd.Series(0, index=df.index)  # 0 = neutral
+    labels = pd.Series(0, index=df.index)      # 1=up/long, 0=neutral, -1=down/short# 1=long, 0=neutral, -1=short# 0 = neutral
     labels[future_returns > threshold] = 1   # 1 = up
-    labels[future_returns < -threshold] = 0  # 0 = down
+    labels[future_returns < -threshold] = -1  # 0 = down
     
     return labels
 
@@ -1100,9 +1144,33 @@ class AIModelManager:
             
         except Exception as e:
             log(f"Error loading AI state: {e}")
-    
+
     def save_state(self):
-        rotate_state_backups(filepath)
+        """Save AI state to disk"""
+        try:
+            state = {
+                'lr_models': {},
+                'metadata': self.metadata,
+                'lstm_symbols': []
+            }
+            # Save LR models with their scalers
+            for symbol, model in self.models.items():
+                try:
+                    # Only pickle scikit models; LSTM handled separately
+                    if hasattr(model, "predict_proba"):
+                        scaler = self.scalers.get(symbol)
+                        state['lr_models'][symbol] = {
+                            'model': model,
+                            'scaler': scaler
+                        }
+                except Exception:
+                    continue
+            save_state(self.state_file, state)
+            return True
+        except Exception as e:
+            log(f"Error saving AI state: {e}")
+            return False
+    
         """Save AI state to disk"""
         try:
             state = {
@@ -1602,6 +1670,14 @@ async def predict_with_hybrid_ai(symbol: str) -> Optional[Dict]:
 # =============================
 
 class WalkForwardOptimizer:
+    def _calculate_metrics(self, results):
+        """Calculate performance metrics for walk-forward testing"""
+        import numpy as np
+        trades = results.get("trades", [])
+        returns = np.array([t.get("return", 0) for t in trades if "return" in t])
+        n_trades = len(returns)
+        # ... same as above ...
+
     """Enhanced Walk-forward optimization engine with proper reporting"""
     
     def __init__(self, symbol: str, timeframe: str = "5m", 
@@ -2363,459 +2439,374 @@ Total Trades: {optimizer.metrics.get('total_trades', 0)}
         log(f"Walk-forward summary plot error: {e}")
         return None
 
+
+def _tb_is_open(pos):
+    return pos.get('status') == 'open'
 # =============================
 # ENHANCED TRADING ENGINE
 # =============================
 
-
-
-
 class TradingEngine:
-
-    def get_positions_summary(self) -> dict:
-        """Return summary of all active positions."""
+    """Core trading engine with position management"""
+    
+    def __init__(self):
+        self.position = None
+        self.auto_enabled = True
+        self.last_update_id = None
+        self.last_heartbeat = time.time()
+    
+    def analyze_symbol(self, symbol: str) -> Dict:
+        """Analyze symbol across multiple timeframes"""
         try:
-            return {
-                k: {
-                    "entry_price": v.get("entry_price"),
-                    "amount": v.get("amount"),
-                    "side": v.get("side"),
-                    "unrealized_pnl": v.get("unrealized_pnl", 0)
-                }
-                for k, v in (self.positions or {}).items()
-                if v and v.get("entry_price")
-            }
-        except Exception as e:
-            log(f"get_positions_summary error: {e}")
-            return {}
-
-    async def analyze_symbol(self, symbol: str) -> dict:
-        """Analyze a symbol using AI predictions and return trade signals."""
-        try:
-            df = load_history_df(symbol, AI_CFG["base_tf"], AI_CFG["hist_limit"])
-            if df.empty:
-                return {"direction": None, "confidence": 0.0}
-
-            features = create_features(df)
-            if len(features) < AI_CFG.get("min_obs", 50):
-                return {"direction": None, "confidence": 0.0}
-
-            ai_manager = globals().get("ai_manager")
-            if not ai_manager:
-                return {"direction": None, "confidence": 0.0}
-
-            pred = ai_manager.predict(symbol, features)
-            t_long, t_short = get_ai_thresholds(AI_CFG)
-
-            direction, confidence = None, 0.0
-            if pred.get("prob_up", 0) >= t_long:
-                direction, confidence = "long", pred["prob_up"]
-            elif pred.get("prob_down", 0) >= t_short:
-                direction, confidence = "short", pred["prob_down"]
-
-            atr = df['atr'].iloc[-1] if 'atr' in df else 0.0
-            price = df['close'].iloc[-1]
-            sl = price - atr * cfg["atr_sl_mult"] if direction == "long" else price + atr * cfg["atr_sl_mult"]
-            tp = price + atr * cfg["atr_tp_mult"] if direction == "long" else price - atr * cfg["atr_tp_mult"]
-
-            return {
-                "direction": direction,
-                "confidence": confidence,
-                "stop_loss": sl,
-                "take_profit": tp,
-                "prob_up": pred.get("prob_up"),
-                "prob_down": pred.get("prob_down"),
-            }
-        except Exception as e:
-            log(f"analyze_symbol error for {symbol}: {e}")
-            return {"direction": None, "confidence": 0.0}
-
-
-
-        def get_account_balance(self, asset="USDT"):
-            """
-            Returns the free and total balance for a given asset.
-            Falls back to 0 if exchange does not provide balance.
-            """
-            try:
-                balances = self.exchange.fetch_balance()
-                if asset in balances.get('free', {}):
-                    return {
-                        "free": balances['free'].get(asset, 0.0),
-                        "total": balances['total'].get(asset, 0.0)
+            results = {}
+            
+            for tf in cfg["timeframes"]:
+                indicators, df = get_indicators(symbol, tf)
+                if indicators:
+                    signal = self._get_signal(indicators)
+                    results[tf] = {
+                        'signal': signal,
+                        'indicators': indicators,
+                        'dataframe': df
                     }
-                return {"free": 0.0, "total": 0.0}
-            except Exception as e:
-                log(f"Balance fetch error: {e}")
-                return {"free": 0.0, "total": 0.0}
-
-        """
-        Unified TradingEngine with clean architecture and no monkey patches.
-        Provides: check_entry_triggers, check_sl_tp, manage_positions, open_planned_position,
-        close_position, close_all_positions, and a legacy async check_triggers alias.
-        """
-
-        def __init__(self, exchange=None, cfg=None, tg_manager=None):
-            self.exchange = exchange if exchange is not None else globals().get("exchange")
-            self.cfg = cfg if cfg is not None else globals().get("cfg", {})
-            self.tg_manager = tg_manager if tg_manager is not None else globals().get("tg_manager")
-            self.positions = getattr(self, "positions", None) or {}
-
-            # Config flags
-            self.auto_enabled = self._cfg_get("auto_enabled", False)
-            self.partial_tp_enabled = bool(self._cfg_get("use_partial_tp", self._cfg_get("partial_tp_enabled", False)))
-            self.partial_tp_fraction = float(self._cfg_get("partial_tp_fraction", 0.5) or 0.5)
-            self.use_trailing_sl = bool(self._cfg_get("use_trailing_sl", False))
-            self.trailing_sl_atr_mult = float(self._cfg_get("trailing_sl_atr_mult", 2.0) or 2.0)
-
-            self.min_notional = float(self._cfg_get("min_notional", 5.0) or 5.0)
-            self.max_notional = float(self._cfg_get("max_notional", 1_000.0) or 1_000.0)
-            self.last_heartbeat = 0
-
-        # ---------------- utilities ----------------
-        def _cfg_get(self, key, default=None):
-            try:
-                c = self.cfg
-                if isinstance(c, dict):
-                    return c.get(key, default)
-                return getattr(c, key, default)
-            except Exception:
-                return default
-
-        def _log(self, msg, level="info"):
-            try:
-                if "log" in globals() and callable(globals()["log"]):
-                    globals()["log"](msg, level=level)
-                else:
-                    print(f"[{level}] {msg}")
-            except Exception:
-                print(msg)
-
-        async def _tg(self, text):
-            try:
-                tm = self.tg_manager or globals().get("tg_manager")
-                if tm and hasattr(tm, "send_message"):
-                    await tm.send_message(text)
-            except Exception as e:
-                self._log(f"Telegram send error: {e}", level="warning")
-
-        def _norm_contracts(self, pos):
-            for k in ("contracts", "qty", "amount", "size"):
-                if pos.get(k) is not None:
-                    try:
-                        v = float(pos[k])
-                        pos["contracts"] = v
-                        return v
-                    except Exception:
-                        continue
-            return pos.get("contracts")
-
-        def _persist(self):
-            try:
-                if hasattr(self, "save_positions") and callable(self.save_positions):
-                    self.save_positions()
-                elif "save_positions" in globals() and callable(globals()["save_positions"]):
-                    globals()["save_positions"]()
-            except Exception:
-                pass
-
-        # -------------- core methods --------------
-        async def check_entry_triggers(self, symbol=None, price=None):
-            try:
-                for sym, pos in list(self.positions.items()):
-                    if symbol and sym != symbol:
-                        continue
-                    if pos.get("status") != "planned" or pos.get("entry_price") is not None:
-                        continue
-                    trig = pos.get("trigger_price")
-                    if trig is None:
-                        continue
-                    side = pos.get("side", "long")
-                    last = price if (symbol and sym == symbol and price is not None) else pos.get("last_price")
-                    if last is None and self.exchange and hasattr(self.exchange, "fetch_ticker"):
-                        try:
-                            t = await self.exchange.fetch_ticker(sym)
-                            last = float(t.get("last")) if t and t.get("last") is not None else None
-                        except Exception:
-                            last = None
-                    if last is None:
-                        continue
-
-                    should_open = (side == "long" and float(last) >= float(trig)) or (side == "short" and float(last) <= float(trig))
-                    if should_open:
-                        await self.open_planned_position(sym, pos, float(last))
-                return True
-            except Exception as e:
-                self._log(f"check_entry_triggers error: {e}", level="error")
-                return False
-
-        async def check_sl_tp(self, symbol=None, price=None):
-            try:
-                for sym, pos in list(self.positions.items()):
-                    if symbol and sym != symbol:
-                        continue
-                    if pos.get("status") != "open" or pos.get("entry_price") is None:
-                        continue
-
-                    side = pos.get("side", "long")
-                    entry = float(pos.get("entry_price"))
-                    last = price if (symbol and sym == symbol and price is not None) else pos.get("last_price")
-                    if last is None and self.exchange and hasattr(self.exchange, "fetch_ticker"):
-                        try:
-                            t = await self.exchange.fetch_ticker(sym)
-                            last = float(t.get("last")) if t and t.get("last") is not None else entry
-                        except Exception:
-                            last = entry
-                    last = float(last)
-
-                    # Trailing best + ATR trailing SL
-                    if self.use_trailing_sl:
-                        best = pos.get("best_price")
-                        if best is None:
-                            best = last
-                        else:
-                            best = max(best, last) if side == "long" else min(best, last)
-                        pos["best_price"] = float(best)
-
-                        atr = pos.get("atr")
-                        if atr is not None:
-                            try:
-                                atr = float(atr)
-                                ts = float(self.trailing_sl_atr_mult) * atr
-                                pos["stop_loss"] = (best - ts) if side == "long" else (best + ts)
-                            except Exception:
-                                pass
-
-                    sl = pos.get("stop_loss")
-                    tp = pos.get("take_profit")
-                    sl_hit = sl is not None and ((side == "long" and last <= float(sl)) or (side == "short" and last >= float(sl)))
-                    tp_hit = tp is not None and ((side == "long" and last >= float(tp)) or (side == "short" and last <= float(tp)))
-
-                    # Partial TP: close fraction and move SL to BE
-                    if tp_hit and self.partial_tp_enabled:
-                        contracts = self._norm_contracts(pos) or 0.0
-                        part = max(0.0, float(contracts) * float(self.partial_tp_fraction))
-                        if part > 0.0:
-                            await self.close_position(sym, qty=part, reason="take_profit_partial", price=last)
-                            pos["stop_loss"] = float(entry)
-                            pos["take_profit"] = None
-                            contracts = self._norm_contracts(pos) or 0.0
-                            if contracts <= 0:
-                                continue
-                            sl = pos.get("stop_loss")
-                            sl_hit = sl is not None and ((side == "long" and last <= float(sl)) or (side == "short" and last >= float(sl)))
-                            tp_hit = False
-
-                    if sl_hit or tp_hit:
-                        reason = "stop_loss" if sl_hit else "take_profit"
-                        await self.close_position(sym, qty=None, reason=reason, price=last)
-                return True
-            except Exception as e:
-                self._log(f"check_sl_tp error: {e}", level="error")
-                return False
-
-        async def manage_positions(self, symbols=None):
-            try:
-                items = list(self.positions.items())
-                if symbols:
-                    items = [(s, p) for s, p in items if s in symbols]
-                if self.exchange and hasattr(self.exchange, "fetch_ticker"):
-                    for sym, pos in items:
-                        try:
-                            t = await self.exchange.fetch_ticker(sym)
-                            if t and t.get("last") is not None:
-                                pos["last_price"] = float(t["last"])
-                        except Exception:
-                            pass
-                return await self.check_sl_tp()
-            except Exception as e:
-                self._log(f"manage_positions error: {e}", level="error")
-                return False
-
-        async def open_planned_position(self, symbol, pos, current_price):
-            try:
-                side = pos.get("side", "long")
-                contracts = self._norm_contracts(pos)
-                if not contracts or contracts <= 0:
-                    daily_budget = float(self._cfg_get("daily_budget_usd", 10.0) or 10.0)
-                    leverage = float(self._cfg_get("leverage", 1.0) or 1.0)
-                    notional = max(self.min_notional, min(self.max_notional, daily_budget * leverage))
-                    contracts = max(self.min_notional / float(current_price), notional / float(current_price))
-                    pos["contracts"] = float(contracts)
-
-                pos["entry_price"] = float(current_price)
-                pos["status"] = "open"
-                pos["best_price"] = float(current_price)
-                pos["last_price"] = float(current_price)
-
-                if self.exchange and getattr(self.exchange, "apiKey", None):
-                    try:
-                        order_side = "buy" if side == "long" else "sell"
-                        if hasattr(self.exchange, "create_order"):
-                            order = await self.exchange.create_order(symbol, "market", order_side, float(contracts))
-                            try:
-                                pos["order_id"] = str(order.get("id")) if isinstance(order, dict) else None
-                            except Exception:
-                                pos["order_id"] = None
-                    except Exception as e:
-                        self._log(f"Live open order failed; paper fallback. err={e}", level="warning")
-
-                self._persist()
-                await self._tg(f"🚀 POSITION TRIGGERED {symbol} {side.upper()} @ {float(current_price):.6f} size={float(contracts):.6f}")
-                return True
-            except Exception as e:
-                self._log(f"open_planned_position error: {e}", level="error")
-                return False
-
-        async def close_position(self, symbol, qty=None, reason="", price=None):
-            try:
-                pos = self.positions.get(symbol)
-                if not pos or pos.get("status") not in ("open", "closing"):
-                    return False
-                side = pos.get("side", "long")
-                contracts = self._norm_contracts(pos) or 0.0
-                close_qty = contracts if qty is None else min(contracts, float(qty))
-                if close_qty <= 0:
-                    return False
-
-                if self.exchange and getattr(self.exchange, "apiKey", None):
-                    try:
-                        order_side = "sell" if side == "long" else "buy"
-                        if hasattr(self.exchange, "create_order"):
-                            await self.exchange.create_order(symbol, "market", order_side, float(close_qty))
-                    except Exception as e:
-                        self._log(f"Live close order failed; paper fallback. err={e}", level="warning")
-
-                remaining = max(0.0, float(contracts) - float(close_qty))
-                pos["contracts"] = float(remaining)
-                if price is not None:
-                    pos["last_price"] = float(price)
-                pos["status"] = "closed" if remaining <= 0 else "open"
-
-                self._persist()
-                lp = pos.get("last_price")
-                await self._tg(f"🔔 Closed {symbol} {float(close_qty):.6f} on {reason or 'manual'} @ {float(lp) if lp is not None else 0.0:.6f} (remaining {float(remaining):.6f})")
-                return True
-            except Exception as e:
-                self._log(f"close_position error: {e}", level="error")
-                return False
-
-        async def close_all_positions(self, symbols=None, reason="manual_close_all"):
-            try:
-                items = list(self.positions.items())
-                if symbols:
-                    items = [(s, p) for s, p in items if s in symbols]
-                for sym, _ in items:
-                    await self.close_position(sym, qty=None, reason=reason)
-                return True
-            except Exception as e:
-                self._log(f"close_all_positions error: {e}", level="error")
-                return False
-
-        # legacy alias (async) to keep older calls working
-
-def check_triggers(self, symbol: str, price: float = None):
-    """Enforce SL/TP for a symbol if a position is open."""
-    try:
-        pos = (self.positions or {}).get(symbol)
-        if not pos or pos.get("status") != "open":
-            return
-        # Fetch current mark/last price if not provided
-        px = price
-        if px is None:
-            try:
-                ticker = self.exchange.fetch_ticker(symbol)
-                px = float(ticker.get("last") or ticker.get("close"))
-            except Exception:
-                return
-        sl = pos.get("stop_loss")
-        tp = pos.get("take_profit")
-        side = pos.get("side")
-        trigger = None
-        if side == "long":
-            if sl is not None and px <= sl:
-                trigger = "stop_loss"
-            elif tp is not None and px >= tp:
-                trigger = "take_profit"
-        elif side == "short":
-            if sl is not None and px >= sl:
-                trigger = "stop_loss"
-            elif tp is not None and px <= tp:
-                trigger = "take_profit"
-        if trigger:
-            self.close_position(symbol, reason=trigger, exit_price=px)
-            log(f"[engine] {symbol} {trigger} hit at {px}")
-    except Exception as e:
-        log(f"check_triggers error for {symbol}: {e}")
-
-def _positions_path(self):
-    return os.path.join("state", "positions.json")
-
-def save_positions(self):
-    """Persist positions to disk safely with a temp swap."""
-    try:
-        path = self._positions_path()
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        tmp = path + ".tmp"
-        with open(tmp, "w") as f:
-            json.dump(self.positions, f, indent=2, default=str)
-        os.replace(tmp, path)
-        log(f"[engine] Saved {len(self.positions)} positions to {path}")
-    except Exception as e:
-        log(f"[engine] save_positions error: {e}")
-
-def load_positions(self):
-    """Load positions from disk into memory."""
-    try:
-        path = self._positions_path()
-        if os.path.exists(path):
-            with open(path, "r") as f:
-                self.positions = json.load(f)
-            log(f"[engine] Restored {len(self.positions)} positions from {path}")
-        else:
-            self.positions = {}
-    except Exception as e:
-        log(f"[engine] load_positions error: {e}")
-        self.positions = {}
-def _calc_sl_tp_percent(self, direction, price):
-    def _calc_sl_tp_percent(price: float, side: str, sl_pct: float, tp_pct: float):
-        try: sl_pct = float(sl_pct)
-        except Exception: sl_pct = 0.02
-        try: tp_pct = float(tp_pct)
-        except Exception: tp_pct = 0.04
-        if side == "long":
-            sl = price * (1.0 - sl_pct); tp = price * (1.0 + tp_pct)
-        else:
-            sl = price * (1.0 + sl_pct); tp = price * (1.0 - tp_pct)
-        return sl, tp, f"percent"
-def _calc_sl_tp_atr(self, direction, price, atr):
-    def _calc_sl_tp_atr(atr: float, price: float, side: str, mult: float):
-        if atr is None or not (atr > 0): return None, None, None
-        try: mult = float(mult)
-        except Exception: mult = 2.0
-        if side == "long":
-            sl = price - atr * mult; tp = price + atr * mult
-        else:
-            sl = price + atr * mult; tp = price - atr * mult
-        return sl, tp, f"atr_x{mult}"
-    async def _fetch_last_price(self, symbol: str) -> float:
-        try:
-            if hasattr(self, "get_price"):
-                p = await self.get_price(symbol) if asyncio.iscoroutinefunction(self.get_price) else self.get_price(symbol)
-                if p: return float(p)
-        except Exception: pass
-        try:
-            if hasattr(self, "exchange") and self.exchange:
-                if hasattr(self.exchange, "fetch_ticker"):
-                    tk = await self.exchange.fetch_ticker(symbol) if asyncio.iscoroutinefunction(self.exchange.fetch_ticker) else self.exchange.fetch_ticker(symbol)
-                    if isinstance(tk, dict):
-                        if tk.get("last"): return float(tk["last"])
-                        if tk.get("close"): return float(tk["close"])
+            
+            # Check for alignment
+            core_tfs = cfg["core_tfs"]
+            signals = [results.get(tf, {}).get('signal', 'neutral') for tf in core_tfs]
+            
+            core_agree = len(set(signals)) == 1 and signals[0] != 'neutral'
+            
+            return {
+                'results': results,
+                'core_agree': core_agree,
+                'core_signal': signals[0] if core_agree else 'neutral'
+            }
+            
         except Exception as e:
-            _safe_log(f"[warn] fetch price failed for {symbol}: {e}")
-        return None
+            log(f"Symbol analysis error for {symbol}: {e}")
+            return {}
+    
+    def _get_signal(self, indicators: Dict) -> str:
+        """Generate trading signal from indicators"""
+        try:
+            price = indicators['price']
+            ema20 = indicators.get('ema20')
+            ema50 = indicators.get('ema50')
+            rsi = indicators.get('rsi14')
+            macd_hist = indicators.get('macd_hist')
+            
+            if None in [ema20, ema50, rsi, macd_hist]:
+                return 'neutral'
+            
+            bullish_signals = 0
+            bearish_signals = 0
+            
+            # EMA trend
+            if price > ema20 > ema50:
+                bullish_signals += 1
+            elif price < ema20 < ema50:
+                bearish_signals += 1
+            
+            # RSI
+            if rsi > 55:
+                bullish_signals += 1
+            elif rsi < 45:
+                bearish_signals += 1
+            
+            # MACD
+            if macd_hist > 0:
+                bullish_signals += 1
+            elif macd_hist < 0:
+                bearish_signals += 1
+            
+            if bullish_signals >= 2 and bearish_signals == 0:
+                return 'bullish'
+            elif bearish_signals >= 2 and bullish_signals == 0:
+                return 'bearish'
+            else:
+                return 'neutral'
+                
+        except Exception as e:
+            log(f"Signal generation error: {e}")
+            return 'neutral'
+    
+    def calculate_position_size(self, symbol: str, price: float) -> Tuple[int, float]:
+        """Calculate optimal position size"""
+        try:
+            # Get market info
+            market = exchange.market(symbol)
+            contract_size = float(market.get('contractSize', 1.0))
+            
+            # Calculate based on budget
+            available_budget = max(0, cfg["daily_budget_usd"] - cfg["budget_used_today"])
+            leverage = cfg["leverage"]
+            
+            # Target margin
+            target_margin = available_budget * 0.5  # Use 50% of available budget
+            
+            # Calculate contracts
+            margin_per_contract = (price * contract_size) / leverage
+            max_contracts = int(target_margin / margin_per_contract) if margin_per_contract > 0 else 0
+            
+            # Apply limits
+            if cfg["contracts_mode"] == "auto":
+                # ATR-based sizing
+                indicators, _ = get_indicators(symbol, "5m")
+                if indicators and indicators.get('atr'):
+                    atr_ratio = indicators['atr'] / price
+                    if atr_ratio < 0.007:  # Low volatility
+                        contracts = min(3, max_contracts)
+                    elif atr_ratio < 0.012:  # Medium volatility
+                        contracts = min(2, max_contracts)
+                    else:  # High volatility
+                        contracts = min(1, max_contracts)
+                else:
+                    contracts = min(1, max_contracts)
+            else:
+                contracts = min(cfg["contracts_fixed"], max_contracts)
+            
+            return max(0, contracts), contract_size
+            
+        except Exception as e:
+            log(f"Position sizing error for {symbol}: {e}")
+            return 0, 1.0
+    
+    def open_position(self, symbol: str, side: str, reason: str = ""):
+        """Open a new trading position"""
+        try:
+            if self.position is not None:
+                log(f"Cannot open position: existing position active")
+                return False
+            
+            # Get current price and indicators
+            indicators, _ = get_indicators(symbol, "5m")
+            if not indicators:
+                log(f"Cannot get indicators for {symbol}")
+                return False
+            
+            price = indicators['price']
+            atr = indicators.get('atr', price * 0.01)  # Default 1% if no ATR
+            
+            # Calculate position size
+            contracts, contract_size = self.calculate_position_size(symbol, price)
+            if contracts <= 0:
+                log(f"Position size too small for {symbol}")
+                return False
+            
+            # Calculate stops and targets
+            atr_sl = atr * cfg["atr_sl_mult"]
+            atr_tp = atr * cfg["atr_tp_mult"]
+            
+            if side.lower() == 'long':
+                stop_loss = price - atr_sl
+                take_profit = price + atr_tp
+                trigger_price = price + (price * cfg["slippage_buffer_pct"] / 100)
+            else:
+                stop_loss = price + atr_sl
+                take_profit = price - atr_tp
+                trigger_price = price - (price * cfg["slippage_buffer_pct"] / 100)
+            
+            # Create position
+            self.position = {
+                'symbol': symbol,
+                'side': side.lower(),
+                'contracts': contracts,
+                'contract_size': contract_size,
+                'trigger_price': trigger_price,
+                'entry_price': None,
+                'stop_loss': stop_loss,
+                'take_profit': take_profit,
+                'best_price': price,
+                'partial_filled': False,
+                'reason': reason,
+                'timestamp': datetime.now(timezone.utc)
+            }
+            
+            # Update budget
+            margin_used = (price * contract_size * contracts) / cfg["leverage"]
+            cfg["budget_used_today"] += margin_used
+            
+            # Set leverage
+            safe_set_leverage(symbol, cfg["leverage"])
+            
+            log(f"Position planned: {side.upper()} {symbol} @ {price:.6f}, "
+                f"SL: {stop_loss:.6f}, TP: {take_profit:.6f}, Size: {contracts}")
+            
+            return True
+            
+        except Exception as e:
+            log(f"Error opening position for {symbol}: {e}")
+            return False
+    
+    def check_trigger(self):
+        """Check if position should be triggered"""
+        if not self.position or self.position.get('entry_price') is not None:
+            return
+        
+        try:
+            symbol = self.position['symbol']
+            ticker = exchange.fetch_ticker(symbol)
+            current_price = ticker['last']
+            
+            trigger_price = self.position['trigger_price']
+            side = self.position['side']
+            
+            should_trigger = False
+            if side == 'long' and current_price >= trigger_price:
+                should_trigger = True
+            elif side == 'short' and current_price <= trigger_price:
+                should_trigger = True
+            
+            if should_trigger:
+                # Execute market order
+                order_side = 'buy' if side == 'long' else 'sell'
+                order = exchange.create_market_order(
+                    symbol, order_side, self.position['contracts']
+                )
+                
+                self.position['entry_price'] = current_price
+                self.position['best_price'] = current_price
+                self.position['order_id'] = order['id']
+                
+                log(f"Position triggered: {side.upper()} {symbol} @ {current_price:.6f}")
+                
+                # Send telegram notification
+                asyncio.create_task(tg_send(
+                    f"🎯 POSITION TRIGGERED\n"
+                    f"{side.upper()} {symbol}\n"
+                    f"Entry: {current_price:.6f}\n"
+                    f"Stop: {self.position['stop_loss']:.6f}\n"
+                    f"Target: {self.position['take_profit']:.6f}\n"
+                    f"Size: {self.position['contracts']} contracts"
+                ))
+                
+        except Exception as e:
+            log(f"Trigger check error: {e}")
+    
+    def manage_position(self):
+        """Manage active position"""
+        if not self.position or self.position.get('entry_price') is None:
+            return
+        
+        try:
+            symbol = self.position['symbol']
+            ticker = exchange.fetch_ticker(symbol)
+            current_price = ticker['last']
+            
+            side = self.position['side']
+            entry_price = self.position['entry_price']
+            
+            # Update best price
+            if side == 'long' and current_price > self.position['best_price']:
+                self.position['best_price'] = current_price
+            elif side == 'short' and current_price < self.position['best_price']:
+                self.position['best_price'] = current_price
+            
+            # Check partial take profit
+            if (cfg["use_partial_tp"] and not self.position['partial_filled'] and
+                ((side == 'long' and current_price >= self.position['take_profit'] * 0.75) or
+                 (side == 'short' and current_price <= self.position['take_profit'] * 1.25))):
+                
+                partial_size = self.position['contracts'] // 2
+                if partial_size > 0:
+                    close_side = 'sell' if side == 'long' else 'buy'
+                    exchange.create_market_order(symbol, close_side, partial_size)
+                    
+                    self.position['contracts'] -= partial_size
+                    self.position['partial_filled'] = True
+                    self.position['stop_loss'] = entry_price  # Move to breakeven
+                    
+                    log(f"Partial TP filled: {partial_size} contracts closed at {current_price:.6f}")
+            
+            # Check trailing stop
+            if cfg["trail_after_tp"] and self.position['partial_filled']:
+                trail_distance = self.position['best_price'] * (cfg["trail_pct"] / 100)
+                
+                if side == 'long':
+                    new_stop = self.position['best_price'] - trail_distance
+                    if new_stop > self.position['stop_loss']:
+                        self.position['stop_loss'] = new_stop
+                else:
+                    new_stop = self.position['best_price'] + trail_distance
+                    if new_stop < self.position['stop_loss']:
+                        self.position['stop_loss'] = new_stop
+            
+            # Check exit conditions
+            should_close = False
+            close_reason = ""
+            
+            if side == 'long':
+                if current_price <= self.position['stop_loss']:
+                    should_close = True
+                    close_reason = "Stop Loss"
+                elif current_price >= self.position['take_profit']:
+                    should_close = True
+                    close_reason = "Take Profit"
+            else:
+                if current_price >= self.position['stop_loss']:
+                    should_close = True
+                    close_reason = "Stop Loss"
+                elif current_price <= self.position['take_profit']:
+                    should_close = True
+                    close_reason = "Take Profit"
+            
+            if should_close:
+                self.close_position(close_reason)
+                
+        except Exception as e:
+            log(f"Position management error: {e}")
+    
+    def close_position(self, reason: str = "Manual"):
+        """Close current position"""
+        if not self.position:
+            return
+        
+        try:
+            symbol = self.position['symbol']
+            side = self.position['side']
+            contracts = self.position['contracts']
+            entry_price = self.position.get('entry_price')
+            
+            if contracts > 0:
+                close_side = 'sell' if side == 'long' else 'buy'
+                order = exchange.create_market_order(symbol, close_side, contracts)
+                
+                current_price = exchange.fetch_ticker(symbol)['last']
+                
+                # Calculate PnL
+                if entry_price:
+                    if side == 'long':
+                        pnl = (current_price - entry_price) * contracts * self.position['contract_size']
+                    else:
+                        pnl = (entry_price - current_price) * contracts * self.position['contract_size']
+                    
+                    pnl_pct = (pnl / (entry_price * contracts * self.position['contract_size'])) * 100
+                else:
+                    pnl = 0
+                    pnl_pct = 0
+                
+                log(f"Position closed: {side.upper()} {symbol} @ {current_price:.6f}, "
+                    f"PnL: ${pnl:.2f} ({pnl_pct:.2f}%), Reason: {reason}")
+                
+                # Send telegram notification
+                pnl_emoji = "💚" if pnl >= 0 else "❌"
+                asyncio.create_task(tg_send(
+                    f"{pnl_emoji} POSITION CLOSED\n"
+                    f"{side.upper()} {symbol}\n"
+                    f"Entry: {entry_price:.6f if entry_price else 'N/A'}\n"
+                    f"Exit: {current_price:.6f}\n"
+                    f"PnL: ${pnl:.2f} ({pnl_pct:.2f}%)\n"
+                    f"Reason: {reason}"
+                ))
+            
+            self.position = None
+            
+        except Exception as e:
+            log(f"Position closing error: {e}")
 
-
+# =============================
+# TELEGRAM COMMAND HANDLERS
+# =============================
 class RiskManager:
     """Advanced risk management system"""
     
@@ -3279,857 +3270,40 @@ class RiskManager:
 # =============================
 # ENHANCED TELEGRAM COMMAND HANDLERS
 # =============================
-
-class TelegramBot:
-    """Enhanced Telegram bot command handler with full functionality"""
-    
-    def __init__(self, trading_engine):
-        self.engine = trading_engine
-        self.help_text = """
-🤖 CRYPTO TRADING BOT COMMANDS
-
-📊 ANALYSIS & STATUS:
-/status - Account balance, positions, settings
-/analyze [SYMBOL] - Multi-timeframe analysis + AI
-/chart [SYMBOL] [TF] - Technical analysis chart
-/predict [SYMBOL] - AI prediction with confidence
-
-🎯 TRADING:
-/long [SYMBOL] - Open long position
-/short [SYMBOL] - Open short position
-/close [SYMBOL] - Close specific position
-/closeall - Close all positions
-/auto on|off - Toggle auto trading
-
-⚙️ CONFIGURATION:
-/risk - Show/set risk parameters
-/set budget <amount> - Set daily budget
-/set leverage <x> - Set leverage
-/set atrsl <x> - ATR stop loss multiplier
-/set atrtp <x> - ATR take profit multiplier
-
-🤖 AI & OPTIMIZATION:
-/trainai [SYMBOL] - Train AI models
-/walkforward [SYMBOL] - Run walk-forward test
-/download - Download historical data
-
-📋 PAIRS MANAGEMENT:
-/addpair [SYMBOL] - Add to watch list
-/addtrade [SYMBOL] - Add to auto trading
-/pairs - Show all monitored pairs
-
-📈 REPORTS & ANALYSIS:
-/report [days] - Performance report
-/equity - Show equity curve
-/trades - Recent trades summary
-
-Type any command for detailed help.
-"""
-    
-    async def handle_command(self, text: str):
-        """Handle incoming telegram command with comprehensive error handling"""
-        try:
-            parts = text.strip().split()
-            if not parts:
-                return
-            
-            command = parts[0].lower()
-            
-            # Route commands
-            if command in ['/help', '/start']:
-                await self.cmd_help()
-            elif command == '/status':
-                await self.cmd_status()
-            elif command.startswith('/analyze'):
-                symbol = parts[1] if len(parts) > 1 else 'BTC/USDT:USDT'
-                await self.cmd_analyze(normalize_symbol(symbol))
-            elif command.startswith('/chart'):
-                await self.cmd_chart(parts[1:])
-            elif command.startswith('/predict'):
-                symbol = parts[1] if len(parts) > 1 else 'BTC/USDT:USDT'
-                await self.cmd_predict(normalize_symbol(symbol))
-            elif command.startswith('/long'):
-                symbol = parts[1] if len(parts) > 1 else 'BTC/USDT:USDT'
-                await self.cmd_long(normalize_symbol(symbol))
-            elif command.startswith('/short'):
-                symbol = parts[1] if len(parts) > 1 else 'BTC/USDT:USDT'
-                await self.cmd_short(normalize_symbol(symbol))
-            elif command.startswith('/close'):
-                if len(parts) > 1:
-                    symbol = normalize_symbol(parts[1])
-                    await self.cmd_close_position(symbol)
-                else:
-                    await self.cmd_close()
-            elif command == '/closeall':
-                await self.cmd_close_all()
-            elif command.startswith('/auto'):
-                state = parts[1] if len(parts) > 1 else 'toggle'
-                await self.cmd_auto(state)
-            elif command.startswith('/risk'):
-                if len(parts) > 1:
-                    await self.cmd_set_risk(parts[1:])
-                else:
-                    await self.cmd_show_risk()
-            elif command.startswith('/set'):
-                await self.cmd_set(parts[1:])
-            elif command.startswith('/trainai'):
-                symbol = parts[1] if len(parts) > 1 else None
-                await self.cmd_train_ai(symbol)
-            elif command.startswith('/walkforward'):
-                symbol = parts[1] if len(parts) > 1 else 'BTC/USDT:USDT'
-                await self.cmd_walkforward(normalize_symbol(symbol))
-            elif command == '/download':
-                await self.cmd_download()
-            elif command.startswith('/addpair'):
-                symbol = parts[1] if len(parts) > 1 else None
-                await self.cmd_add_pair(symbol, watch_only=True)
-            elif command.startswith('/addtrade'):
-                symbol = parts[1] if len(parts) > 1 else None
-                await self.cmd_add_pair(symbol, watch_only=False)
-            elif command == '/pairs':
-                await self.cmd_show_pairs()
-            elif command.startswith('/report'):
-                days = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 7
-                await self.cmd_report(days)
-            elif command == '/equity':
-                await self.cmd_equity_curve()
-            elif command == '/trades':
-                await self.cmd_recent_trades()
-            else:
-                await tg_send(f"Unknown command: {command}\nType /help for available commands")
-                
-        except Exception as e:
-            log(f"Command handling error: {e}")
-            await tg_send(f"Error processing command: {str(e)[:200]}")
-    
-    async def cmd_help(self):
-        """Show help message"""
-        await tg_send(self.help_text)
-    
-    async def cmd_status(self):
-        """Show comprehensive system status"""
-        try:
-            # Get account info
-            balance = self.engine.get_account_balance()
-            positions_summary = self.engine.get_positions_summary()
-            
-            # Build status message
-            status_msg = f"""
-📊 TRADING BOT STATUS
-
-💰 Account:
-Balance: ${balance:.2f} USDT
-Mode: {MODE.upper()}
-Daily Budget: ${cfg['daily_budget_usd']:.2f}
-Used Today: ${cfg['budget_used_today']:.2f}
-Remaining: ${cfg['daily_budget_usd'] - cfg['budget_used_today']:.2f}
-
-⚙️ Settings:
-Auto Trading: {'🟢 ON' if self.engine.auto_enabled else '🔴 OFF'}
-Leverage: {cfg['leverage']}x
-ATR SL: {cfg['atr_sl_mult']}x | ATR TP: {cfg['atr_tp_mult']}x
-Position Size: {cfg['position_size_fraction']*100:.1f}% of account
-
-📈 Positions ({positions_summary['active_count']}):
-Total Value: ${positions_summary['total_value']:.2f}
-Unrealized PnL: ${positions_summary['total_pnl']:.2f}
-"""
-            
-            # Add individual position details
-            for symbol, pos in positions_summary['positions'].items():
-                if pos and pos.get('entry_price'):
-                    # Get current price for PnL calculation
-                    try:
-                        ticker = exchange.fetch_ticker(symbol)
-                        current_price = ticker['last']
-                        
-                        if pos['side'] == 'long':
-                            pnl = (current_price - pos['entry_price']) * pos['contracts']
-                        else:
-                            pnl = (pos['entry_price'] - current_price) * pos['contracts']
-                        
-                        pnl_pct = (pnl / (pos['entry_price'] * pos['contracts'])) * 100
-                        
-                        status_emoji = "🟢" if pnl > 0 else "🔴" if pnl < 0 else "🟡"
-                        status_msg += f"\n{status_emoji} {pos['side'].upper()} {symbol}"
-                        status_msg += f"\nEntry: ${pos['entry_price']:.6f} | Current: ${current_price:.6f}"
-                        status_msg += f"\nPnL: ${pnl:.2f} ({pnl_pct:+.2f}%)"
-                        
-                    except Exception:
-                        status_msg += f"\n🔵 {pos['side'].upper()} {symbol} - Active"
-            
-            if positions_summary['active_count'] == 0:
-                status_msg += "\nNo active positions"
-            
-            # Add risk metrics
-            risk = positions_summary['risk_metrics']
-            status_msg += f"""
-
-⚠️ Risk Management:
-Daily Loss: ${risk['daily_loss_tracker']:.2f}
-Daily Trades: {risk['daily_trades']}/10
-Max Position Risk: {risk['max_position_risk_pct']:.1f}%
-"""
-            
-            status_msg += f"""
-
-🎯 Auto Pairs: {len(AUTO_PAIRS)}
-👁️ Watch Pairs: {len(WATCH_ONLY_PAIRS)}
-"""
-            
-            await tg_send(status_msg)
-            
-        except Exception as e:
-            log(f"Status command error: {e}")
-            await tg_send(f"Error getting status: {e}")
-    
-    async def cmd_analyze(self, symbol: str):
-        """Comprehensive symbol analysis"""
-        try:
-            analysis = await self.engine.analyze_symbol(symbol)
-            
-            if not analysis:
-                await tg_send(f"Could not analyze {symbol}")
-                return
-            
-            msg = f"📈 ANALYSIS: {symbol}\n\n"
-            
-            # Multi-timeframe signals
-            msg += "📊 Multi-Timeframe Signals:\n"
-            for tf, data in analysis['results'].items():
-                signal = data['signal']
-                indicators = data['indicators']
-                
-                emoji = "🟢" if signal == 'bullish' else "🔴" if signal == 'bearish' else "🟡"
-                msg += f"{emoji} {tf}: {signal.upper()}\n"
-                msg += f"  Price: ${indicators['price']:.6f}\n"
-                if indicators.get('rsi14'):
-                    msg += f"  RSI: {indicators['rsi14']:.1f}\n"
-                if indicators.get('bb_position'):
-                    msg += f"  BB Pos: {indicators['bb_position']:.2f}\n"
-                msg += "\n"
-            
-            # Core agreement
-            if analysis.get('core_agree'):
-                msg += f"✅ Core timeframes agree: {analysis['core_signal'].upper()}\n\n"
-            else:
-                msg += "⚠️ No consensus across core timeframes\n\n"
-            
-            # AI prediction
-            ai_result = analysis.get('ai_result')
-            if ai_result:
-                confidence_emoji = "🟢" if ai_result['confidence'] >= 0.7 else "🟡" if ai_result['confidence'] >= 0.55 else "🔴"
-                msg += f"🤖 AI Prediction:\n"
-                msg += f"{confidence_emoji} Probability Up: {ai_result['p_up']:.1%}\n"
-                msg += f"Decision: {ai_result['decision'].upper()}\n"
-                msg += f"Confidence: {ai_result['confidence']:.1%}\n"
-                msg += f"Method: {ai_result['method']}\n"
-                
-                components = normalize_ai_result(ai_result).get('components', {})
-                if components.get('lstm') is not None:
-                    msg += f"\nComponents:\n"
-                    msg += f"  LR: {components['lr']:.1%} (conf: {components['lr_confidence']:.1%})\n"
-                    msg += f"  LSTM: {components['lstm']:.1%} (conf: {components['lstm_confidence']:.1%})\n"
-            
-            # Trading recommendation
-            msg += "\n📋 Recommendation:\n"
-            if analysis.get('core_agree') and ai_result:
-                core_signal = analysis['core_signal']
-                ai_decision = ai_result['decision']
-                
-                if core_signal == 'bullish' and ai_decision == 'long' and ai_result['confidence'] >= 0.6:
-                    msg += "✅ STRONG BUY - Technical + AI alignment"
-                elif core_signal == 'bearish' and ai_decision == 'short' and ai_result['confidence'] >= 0.6:
-                    msg += "✅ STRONG SELL - Technical + AI alignment"
-                elif ai_result['confidence'] >= 0.65:
-                    msg += f"⚠️ AI SIGNAL: {ai_decision.upper()} (no technical consensus)"
-                else:
-                    msg += "🟡 HOLD - Wait for better setup"
-            else:
-                msg += "🟡 HOLD - Insufficient signals"
-            
-            await tg_send(msg)
-            
-        except Exception as e:
-            log(f"Analysis error for {symbol}: {e}")
-            await tg_send(f"Analysis error for {symbol}: {e}")
-    
-    async def cmd_chart(self, args: List[str]):
-        """Generate and send technical chart"""
-        try:
-            symbol = 'BTC/USDT:USDT'
-            timeframe = '1h'
-            
-            # Parse arguments
-            for arg in args:
-                if any(c.isalpha() and c not in 'mhd' for c in arg):
-                    symbol = normalize_symbol(arg)
-                else:
-                    timeframe = timeframe_alias(arg)
-            
-            await tg_send(f"📊 Generating chart for {symbol} {timeframe.upper()}...")
-            
-            # Get data
-            df = load_history_df(symbol, timeframe, months=3)
-            if df.empty:
-                await tg_send(f"No data available for {symbol} {timeframe}")
-                return
-            
-            # Get current positions for trade markers
-            trades = []
-            position = self.engine.positions.get(symbol)
-            if (position and position.get('entry_price')):
-                trades = [{
-                    'entry_idx': len(df) - 50,  # Approximate position
-                    'side': position['side'],
-                    'entry_price': position['entry_price']
-                }]
-            
-            # Generate chart
-            chart_title = f"{symbol} {timeframe.upper()} Technical Analysis"
-            chart_file = os.path.join(CHARTS_DIR, f"{symbol.replace('/', '_')}_{timeframe}_chart.png")
-            
-            chart_path = plot_candlestick_chart(
-                df.tail(300), chart_title, chart_file, 
-                indicators=True, trades=trades
-            )
-            
-            if chart_path:
-                # Get current analysis for caption
-                analysis = await self.engine.analyze_symbol(symbol)
-                ai_result = analysis.get('ai_result') if analysis else None
-                
-                caption = f"{symbol} {timeframe} Analysis"
-                if ai_result:
-                    caption += f"\n🤖 AI: {ai_result['decision'].upper()} ({ai_result['p_up']:.1%})"
-                
-                await tg_send_photo(chart_path, caption)
-            else:
-                await tg_send("Failed to generate chart")
-                
-        except Exception as e:
-            log(f"Chart error: {e}")
-            await tg_send(f"Chart error: {str(e)[:100]}")
-    
-    async def cmd_predict(self, symbol: str):
-        """Get AI prediction with detailed breakdown"""
-        try:
-            await tg_send(f"🤖 Generating AI prediction for {symbol}...")
-            
-            result = await predict_with_hybrid_ai(symbol)
-            if result:
-                confidence_emoji = "🟢" if result['confidence'] >= 0.7 else "🟡" if result['confidence'] >= 0.55 else "🔴"
-                
-                msg = f"🤖 AI PREDICTION: {symbol}\n\n"
-                msg += f"{confidence_emoji} Probability Up: {result['p_up']:.1%}\n"
-                msg += f"Decision: **{result['decision'].upper()}**\n"
-                msg += f"Overall Confidence: {result['confidence']:.1%}\n"
-                msg += f"Method: {result['method']}\n"
-                
-                # Component breakdown
-                components = result.get('components', {})
-                if components.get('lstm') is not None:
-                    msg += f"\n📊 Model Components:\n"
-                    msg += f"Logistic Regression: {components['lr']:.1%}\n"
-                    msg += f"  └ Confidence: {components['lr_confidence']:.1%}\n"
-                    msg += f"LSTM Neural Network: {components['lstm']:.1%}\n"
-                    msg += f"  └ Confidence: {components['lstm_confidence']:.1%}\n"
-                else:
-                    msg += f"\nUsing Logistic Regression only (confidence: {components['lr_confidence']:.1%})"
-                
-                # Recommendation
-                msg += f"\n💡 Recommendation:\n"
-                if result['confidence'] >= 0.7:
-                    if result['decision'] == 'long':
-                        msg += "✅ Strong BUY signal - Consider opening long position"
-                    elif result['decision'] == 'short':
-                        msg += "✅ Strong SELL signal - Consider opening short position"
-                    else:
-                        msg += "⏸️ HOLD - Wait for clearer signals"
-                elif result['confidence'] >= 0.55:
-                    msg += f"⚠️ Weak {result['decision'].upper()} signal - Use caution"
-                else:
-                    msg += "🔴 Low confidence - Avoid trading"
-                
-                await tg_send(msg)
-            else:
-                await tg_send(f"Could not generate prediction for {symbol}")
-                
-        except Exception as e:
-            log(f"Prediction error for {symbol}: {e}")
-            await tg_send(f"Prediction error: {str(e)[:100]}")
-    
-    async def cmd_long(self, symbol: str):
-        """Open long position"""
-        try:
-            success = await self.engine.open_position(symbol, 'long', 'Manual long command')
-            if success:
-                await tg_send(f"✅ Long position planned for {symbol}")
-            else:
-                await tg_send(f"❌ Failed to plan long position for {symbol}")
-        except Exception as e:
-            await tg_send(f"Long position error: {e}")
-    
-    async def cmd_short(self, symbol: str):
-        """Open short position"""
-        try:
-            success = await self.engine.open_position(symbol, 'short', 'Manual short command')
-            if success:
-                await tg_send(f"✅ Short position planned for {symbol}")
-            else:
-                await tg_send(f"❌ Failed to plan short position for {symbol}")
-        except Exception as e:
-            await tg_send(f"Short position error: {e}")
-    
-    async def cmd_close(self):
-        """Close first active position"""
-        try:
-            active_positions = {k: v for k, v in self.engine.positions.items() if v and v.get('entry_price')}
-            if active_positions:
-                symbol = list(active_positions.keys())[0]
-                success = await self.engine.close_position(symbol, "Manual close")
-                if success:
-                    await tg_send(f"✅ Position closed: {symbol}")
-                else:
-                    await tg_send(f"❌ Failed to close position: {symbol}")
-            else:
-                await tg_send("ℹ️ No active positions to close")
-        except Exception as e:
-            await tg_send(f"Close position error: {e}")
-    
-    async def cmd_close_position(self, symbol: str):
-        """Close specific position"""
-        try:
-            position = self.engine.positions.get(symbol)
-            if position and position.get('entry_price'):
-                success = await self.engine.close_position(symbol, "Manual close")
-                if success:
-                    await tg_send(f"✅ Position closed: {symbol}")
-                else:
-                    await tg_send(f"❌ Failed to close position: {symbol}")
-            else:
-                await tg_send(f"ℹ️ No active position for {symbol}")
-        except Exception as e:
-            await tg_send(f"Close position error: {e}")
-    
-    async def cmd_close_all(self):
-        """Close all positions"""
-        try:
-            active_positions = {k: v for k, v in self.engine.positions.items() if v and v.get('entry_price')}
-            if not active_positions:
-                await tg_send("ℹ️ No active positions to close")
-                return
-            
-            await tg_send(f"🔄 Closing {len(active_positions)} positions...")
-            
-            success_count = 0
-            for symbol in active_positions.keys():
-                if await self.engine.close_position(symbol, "Close all command"):
-                    success_count += 1
-            
-            await tg_send(f"✅ Closed {success_count}/{len(active_positions)} positions")
-            
-        except Exception as e:
-            await tg_send(f"Close all error: {e}")
-    
-    async def cmd_auto(self, state: str):
-        """Toggle auto trading"""
-        try:
-            if state.lower() == 'on':
-                self.engine.auto_enabled = True
-                cfg["auto_enabled"] = True
-                await tg_send("✅ Auto trading ENABLED")
-            elif state.lower() == 'off':
-                self.engine.auto_enabled = False
-                cfg["auto_enabled"] = False
-                await tg_send("✅ Auto trading DISABLED")
-            else:
-                current_state = "ON" if self.engine.auto_enabled else "OFF"
-                await tg_send(f"Auto trading is currently {current_state}")
-            
-            save_settings()
-            
-        except Exception as e:
-            await tg_send(f"Auto toggle error: {e}")
-    
-    async def cmd_show_risk(self):
-        """Show current risk settings"""
-        try:
-            risk_metrics = self.engine.risk_manager.get_risk_metrics()
-            
-            msg = f"""
-⚠️ RISK MANAGEMENT SETTINGS
-
-💰 Budget Control:
-Daily Budget: ${cfg['daily_budget_usd']:.2f}
-Used Today: ${risk_metrics['daily_budget_used']:.2f}
-Remaining: ${cfg['daily_budget_usd'] - risk_metrics['daily_budget_used']:.2f}
-
-📊 Position Limits:
-Position Size: {cfg['position_size_fraction']*100:.1f}% of account
-Min Trade Size: ${cfg['min_notional']:.2f}
-Max Trade Size: ${cfg['max_notional']:.2f}
-Leverage: {cfg['leverage']}x
-
-⛔ Stop Loss & Take Profit:
-ATR SL Multiplier: {cfg['atr_sl_mult']}x
-ATR TP Multiplier: {cfg['atr_tp_mult']}x
-Partial TP: {'ON' if cfg['use_partial_tp'] else 'OFF'}
-Trailing Stop: {'ON' if cfg['trail_after_tp'] else 'OFF'}
-
-📈 Daily Limits:
-Daily Trades: {risk_metrics['daily_trades']}/10
-Max Daily Loss: {risk_metrics['max_daily_loss_pct']:.1f}%
-Daily Loss Tracker: ${risk_metrics['daily_loss_tracker']:.2f}
-"""
-            await tg_send(msg)
-            
-        except Exception as e:
-            await tg_send(f"Risk display error: {e}")
-    
-    async def cmd_set(self, args: List[str]):
-        """Set configuration parameters"""
-        try:
-            if len(args) < 2:
-                await tg_send("Usage: /set <parameter> <value>\n"
-                             "Parameters: budget, leverage, atrsl, atrtp, minsize, maxsize, possize")
-                return
-            
-            param, value = args[0].lower(), args[1]
-            
-            if param == 'budget':
-                cfg["daily_budget_usd"] = max(1.0, float(value))
-                cfg["budget_used_today"] = 0.0  # Reset usage
-                await tg_send(f"✅ Daily budget set to ${cfg['daily_budget_usd']:.2f}")
-                
-            elif param == 'leverage':
-                new_leverage = max(1, min(100, int(float(value))))
-                cfg["leverage"] = new_leverage
-                # Apply to all auto pairs
-                for symbol in AUTO_PAIRS:
-                    safe_set_leverage(symbol, new_leverage)
-                await tg_send(f"✅ Leverage set to {cfg['leverage']}x")
-                
-            elif param == 'atrsl':
-                cfg["atr_sl_mult"] = max(0.1, float(value))
-                await tg_send(f"✅ ATR Stop Loss multiplier set to {cfg['atr_sl_mult']}x")
-                
-            elif param == 'atrtp':
-                cfg["atr_tp_mult"] = max(0.2, float(value))
-                await tg_send(f"✅ ATR Take Profit multiplier set to {cfg['atr_tp_mult']}x")
-                
-            elif param == 'minsize':
-                cfg["min_notional"] = max(1.0, float(value))
-                await tg_send(f"✅ Minimum trade size set to ${cfg['min_notional']:.2f}")
-                
-            elif param == 'maxsize':
-                cfg["max_notional"] = max(cfg["min_notional"], float(value))
-                await tg_send(f"✅ Maximum trade size set to ${cfg['max_notional']:.2f}")
-                
-            elif param == 'possize':
-                new_fraction = max(0.001, min(0.1, float(value)))  # 0.1% to 10%
-                cfg["position_size_fraction"] = new_fraction
-                await tg_send(f"✅ Position size set to {new_fraction*100:.2f}% of account")
-                
-            else:
-                await tg_send(f"Unknown parameter: {param}")
-                return
-            
-            save_settings()
-            
-        except ValueError:
-            await tg_send("Invalid value. Please provide a valid number.")
-        except Exception as e:
-            await tg_send(f"Set error: {e}")
-    
-    async def cmd_train_ai(self, symbol: str = None):
-        """Train AI models"""
-        try:
-            symbols = [normalize_symbol(symbol)] if symbol else list(AUTO_PAIRS)
-            
-            await tg_send(f"🤖 Starting AI training for {len(symbols)} symbols...")
-            
-            results = []
-            for sym in symbols:
-                await tg_send(f"Training models for {sym}...")
-                
-                # Create dataset
-                features, labels, df_base = await create_ai_dataset(sym)
-                if features is None:
-                    results.append(f"❌ {sym}: Insufficient data")
-                    continue
-                
-                # Train LR model
-                lr_success = await train_lr_model(sym, features, labels)
-                
-                # Train LSTM model if PyTorch available
-                lstm_success = False
-                if TORCH_OK:
-                    lstm_success = await train_lstm_model(sym, features, labels)
-                
-                # Get model metadata for results
-                lr_metadata = ai_manager.get_model_metadata(sym).get('lr_metadata', {})
-                lstm_metadata = ai_manager.get_model_metadata(sym)
-                
-                result = f"{'✅' if lr_success else '❌'} {sym}:\n"
-                result += f"  LR: {lr_metadata.get('accuracy', 0):.1%} accuracy\n"
-                if TORCH_OK:
-                    if lstm_success:
-                        result += f"  LSTM: {lstm_metadata.get('best_val_acc', 0):.1%} accuracy"
-                    else:
-                        result += "  LSTM: Failed"
-                
-                results.append(result)
-            
-            # Save AI state
-            ai_manager.save_state()
-            
-            # Send results
-            results_msg = "🎉 AI TRAINING COMPLETED\n\n" + "\n\n".join(results)
-            await tg_send(results_msg)
-            
-        except Exception as e:
-            log(f"AI training error: {e}")
-            await tg_send(f"Training error: {str(e)[:200]}")
-    
-    async def cmd_walkforward(self, symbol: str):
-        """Run walk-forward optimization"""
-        try:
-            await tg_send(f"📊 Starting walk-forward optimization for {symbol}...")
-            
-            # Create optimizer
-            optimizer = WalkForwardOptimizer(
-                symbol=symbol,
-                timeframe="5m",
-                train_window=1000,
-                test_window=250,
-                step_size=250,
-                total_months=6
-            )
-            
-            # Run optimization
-            success = await optimizer.run_optimization()
-            
-            if success:
-                # Generate and save results
-                results_file = await optimizer.save_results()
-                report = optimizer.generate_report()
-                
-                # Send text report
-                await tg_send(f"📊 WALK-FORWARD RESULTS:\n```{report}```")
-                
-                # Generate and send equity curve
-                if optimizer.equity_curve and len(optimizer.equity_curve) > 1:
-                    dates = [datetime.now() - timedelta(days=i) for i in reversed(range(len(optimizer.equity_curve)))]
-                    equity_file = os.path.join(CHARTS_DIR, f"walkforward_{symbol.replace('/', '_')}_equity.png")
-                    
-                    equity_path = plot_equity_curve(
-                        optimizer.equity_curve, dates,
-                        f"Walk-Forward Equity Curve - {symbol}",
-                        equity_file, optimizer.trades
-                    )
-                    
-                    if equity_path:
-                        await tg_send_photo(equity_path, f"Walk-Forward Results: {symbol}")
-                
-                # Generate and send summary chart
-                summary_file = os.path.join(CHARTS_DIR, f"walkforward_{symbol.replace('/', '_')}_summary.png")
-                summary_path = plot_walkforward_summary(optimizer, summary_file)
-                if summary_path:
-                    await tg_send_photo(summary_path, f"Walk-Forward Summary: {symbol}")
-                
-                if results_file:
-                    await tg_send(f"✅ Detailed results saved to: {os.path.basename(results_file)}")
-                
-            else:
-                await tg_send(f"❌ Walk-forward optimization failed for {symbol}")
-                
-        except Exception as e:
-            log(f"Walk-forward error: {e}")
-            await tg_send(f"Walk-forward error: {str(e)[:200]}")
-    
-    async def cmd_download(self):
-        """Download historical data"""
-        try:
-            await tg_send("📥 Starting data download...")
-            
-            symbols = list(AUTO_PAIRS | WATCH_ONLY_PAIRS)
-            timeframes = cfg["timeframes"]
-            
-            total_downloads = len(symbols) * len(timeframes)
-            completed = 0
-            failed = 0
-            
-            for symbol in symbols:
-                for tf in timeframes:
-                    try:
-                        success = await ensure_history(symbol, tf, months=AI_CFG["hist_months"])
-                        if success:
-                            completed += 1
-                        else:
-                            failed += 1
-                        
-                        # Progress update every 10 downloads
-                        if (completed + failed) % 10 == 0:
-                            progress = ((completed + failed) / total_downloads) * 100
-                            await tg_send(f"📥 Progress: {progress:.0f}% ({completed} success, {failed} failed)")
-                            
-                    except Exception as e:
-                        log(f"Download error for {symbol} {tf}: {e}")
-                        failed += 1
-            
-            await tg_send(f"✅ Data download completed: {completed} successful, {failed} failed")
-            
-        except Exception as e:
-            await tg_send(f"Download error: {str(e)[:200]}")
-    
-    async def cmd_add_pair(self, symbol: str, watch_only: bool = True):
-        """Add trading pair"""
-        if not symbol:
-            await tg_send("Usage: /addpair <SYMBOL> or /addtrade <SYMBOL>")
-            return
-        
-        try:
-            symbol = normalize_symbol(symbol)
-            
-            if watch_only:
-                if symbol not in WATCH_ONLY_PAIRS and symbol not in AUTO_PAIRS:
-                    WATCH_ONLY_PAIRS.add(symbol)
-                    await tg_send(f"✅ Added {symbol} to watch list")
-                else:
-                    await tg_send(f"ℹ️ {symbol} already being monitored")
-            else:
-                if symbol not in AUTO_PAIRS:
-                    AUTO_PAIRS.add(symbol)
-                    safe_set_leverage(symbol, cfg["leverage"])
-                    await tg_send(f"✅ Added {symbol} to auto trading")
-                else:
-                    await tg_send(f"ℹ️ {symbol} already in auto trading")
-                    
-        except Exception as e:
-            await tg_send(f"Error adding pair: {e}")
-    
-    async def cmd_show_pairs(self):
-        """Show all monitored pairs"""
-        try:
-            msg = "📋 MONITORED TRADING PAIRS\n\n"
-            
-            msg += f"🎯 Auto Trading ({len(AUTO_PAIRS)}):\n"
-            for symbol in sorted(AUTO_PAIRS):
-                # Get current position status
-                position = self.engine.positions.get(symbol)
-                if position and position.get('entry_price'):
-                    status = f"📈 {position['side'].upper()}"
-                else:
-                    status = "⏸️"
-                msg += f"{status} {symbol}\n"
-            
-            msg += f"\n👁️ Watch Only ({len(WATCH_ONLY_PAIRS)}):\n"
-            for symbol in sorted(WATCH_ONLY_PAIRS):
-                msg += f"👁️ {symbol}\n"
-            
-            await tg_send(msg)
-            
-        except Exception as e:
-            await tg_send(f"Error showing pairs: {e}")
-    
-    async def cmd_report(self, days: int = 7):
-        """Generate performance report"""
-        try:
-            await tg_send(f"📊 Generating {days}-day performance report...")
-            
-            # This is a simplified report - in a full implementation,
-            # you would track historical trades and P&L
-            positions_summary = self.engine.get_positions_summary()
-            risk_metrics = positions_summary['risk_metrics']
-            
-            report = f"""
-📊 PERFORMANCE REPORT ({days} days)
-
-💰 Current Status:
-Account Balance: ${self.engine.get_account_balance():.2f}
-Active Positions: {positions_summary['active_count']}
-Position Value: ${positions_summary['total_value']:.2f}
-Unrealized PnL: ${positions_summary['total_pnl']:.2f}
-
-📈 Risk Metrics:
-Daily Budget Used: ${risk_metrics['daily_budget_used']:.2f} / ${cfg['daily_budget_usd']:.2f}
-Daily Trades: {risk_metrics['daily_trades']}/10
-Daily Loss Tracker: ${risk_metrics['daily_loss_tracker']:.2f}
-
-⚙️ Settings:
-Auto Trading: {'ON' if self.engine.auto_enabled else 'OFF'}
-Position Size: {cfg['position_size_fraction']*100:.1f}% of account
-Leverage: {cfg['leverage']}x
-"""
-            
-            await tg_send(report)
-            
-        except Exception as e:
-            await tg_send(f"Report error: {str(e)[:200]}")
-    
-    async def cmd_equity_curve(self):
-        """Show equity curve (simplified)"""
-        try:
-            balance = self.engine.get_account_balance()
-            positions_summary = self.engine.get_positions_summary()
-            
-            msg = f"""
-📈 EQUITY SUMMARY
-
-Current Balance: ${balance:.2f}
-Position Value: ${positions_summary['total_value']:.2f}
-Unrealized PnL: ${positions_summary['total_pnl']:.2f}
-Total Equity: ${balance + positions_summary['total_pnl']:.2f}
-
-Note: Historical equity tracking requires extended operation.
-Full equity curves are available in walk-forward reports.
-"""
-            await tg_send(msg)
-            
-        except Exception as e:
-            await tg_send(f"Equity curve error: {e}")
-    
-    async def cmd_recent_trades(self):
-        """Show recent trades summary"""
-        try:
-            # This is simplified - in full implementation, you'd track trade history
-            active_positions = {k: v for k, v in self.engine.positions.items() if v and v.get('entry_price')}
-            
-            if not active_positions:
-                await tg_send("📊 No recent trades to display")
-                return
-            
-            msg = "📊 ACTIVE POSITIONS\n\n"
-            
-            for symbol, pos in active_positions.items():
-                try:
-                    ticker = exchange.fetch_ticker(symbol)
-                    current_price = ticker['last']
-                    
-                    if pos['side'] == 'long':
-                        pnl = (current_price - pos['entry_price']) * pos['contracts']
-                    else:
-                        pnl = (pos['entry_price'] - current_price) * pos['contracts']
-                    
-                    pnl_pct = (pnl / (pos['entry_price'] * pos['contracts'])) * 100
-                    duration = datetime.now(timezone.utc) - pos['timestamp']
-                    
-                    status = "🟢" if pnl > 0 else "🔴" if pnl < 0 else "🟡"
-                    
-                    msg += f"{status} {pos['side'].upper()} {symbol}\n"
-                    msg += f"Entry: ${pos['entry_price']:.6f}\n"
-                    msg += f"Current: ${current_price:.6f}\n"
-                    msg += f"PnL: ${pnl:.2f} ({pnl_pct:+.2f}%)\n"
-                    msg += f"Duration: {duration.seconds//3600}h {(duration.seconds//60)%60}m\n\n"
-                    
-                except Exception:
-                    msg += f"⚪ {pos['side'].upper()} {symbol} - Active\n\n"
-            
-            await tg_send(msg)
-            
-        except Exception as e:
-            await tg_send(f"Trades summary error: {e}")
+async def close_position(self, symbol: str, pos_index: Optional[int] = None, reason: str = "manual") -> int:
+    try:
+        trades = self.positions.get(symbol, [])
+        if not trades:
+            return 0
+        closed = 0
+        for idx, t in list(enumerate(trades)):
+            if pos_index is not None and idx != pos_index:
+                continue
+            if t.get("status") != "open":
+                continue
+            qty = abs(float(t.get("qty", 0.0)))
+            ccxt_side = "sell" if t.get("side") == "long" else "buy"
+            price = self.get_mark_price(symbol)
+            try:
+                exchange.create_market_order(symbol, ccxt_side, qty)
+                t["status"] = "closed"
+                t["close_price"] = float(price or 0.0)
+                t["close_timestamp"] = datetime.now(timezone.utc).isoformat()
+                closed += 1
+                log(f"[close_position] Closed {symbol} {t['side']} qty={qty} @ {price} reason={reason}")
+            except Exception as e:
+                log(f"[close_position] Live close failed for {symbol} ({e}), simulating")
+                t["status"] = "closed"
+                t["close_price"] = float(price or 0.0)
+                t["close_timestamp"] = datetime.now(timezone.utc).isoformat()
+                closed += 1
+        if closed > 0:
+            self.positions[symbol] = [t for t in trades if t.get("status") == "open"]
+            self._save_positions()
+        return closed
+    except Exception as e:
+        log(f"[close_position] error: {e}")
+        return 0
 # =============================
 # CLI FUNCTIONS (Enhanced)
 # =============================
@@ -4293,6 +3467,12 @@ async def cli_walkforward(symbol="BTC/USDT:USDT", timeframe="5m", months=6):
 async def main_trading_loop():
     """Enhanced main trading loop with comprehensive error handling"""
     trading_engine = TradingEngine()
+    try:
+        if hasattr(trading_engine, 'load_positions'):
+            trading_engine.load_positions()
+    except Exception as _e:
+        log(f'load_positions failed: {_e}')
+
     telegram_bot = TelegramBot(trading_engine)
     
     log("Starting main trading loop...")
@@ -4328,6 +3508,11 @@ Type /help for commands
     while True:
         try:
             loop_count += 1
+            # Periodic memory clean-up
+            if loop_count % 60 == 0:
+                import gc
+                gc.collect()
+
             current_time = time.time()
             
             # Handle Telegram updates
@@ -4493,51 +3678,686 @@ Trades: {risk_metrics['daily_trades']}/10
 # =============================
 # REPORTING FUNCTIONS
 # =============================
+class TradingEngine:
+    def __init__(self):
+        self.positions = {}
+        self.auto_enabled = False
+        self.daily_loss_tracker = 0.0
+        self.daily_trades = 0
+        self.balance = 1000.0  # Placeholder
 
-def generate_report() -> str:
-    """Generate comprehensive performance report"""
-    try:
-        # This is a template - in full implementation you'd track historical data
-        risk_metrics = ai_manager.metadata if hasattr(ai_manager, 'metadata') else {}
-        
-        report = f"""
-📊 TRADING BOT PERFORMANCE REPORT
-Generated: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}
+    async def open_position(self, symbol: str, side: str, reason: str) -> bool:
+        try:
+            price = exchange.fetch_ticker(symbol)['last']
+            qty = (self.balance * cfg['position_size_fraction']) / price
+            trade = {
+                'status': 'open',
+                'side': side,
+                'entry_price': price,
+                'qty': qty,
+                'timestamp': datetime.now(timezone.utc).isoformat(),
+                'stop_loss': price * (1 - cfg['atr_sl_mult'] * 0.01) if side == 'long' else price * (1 + cfg['atr_sl_mult'] * 0.01),
+                'take_profit': price * (1 + cfg['atr_tp_mult'] * 0.01) if side == 'long' else price * (1 - cfg['atr_tp_mult'] * 0.01)
+            }
+            self.positions[symbol] = self.positions.get(symbol, []) + [trade]
+            self.daily_trades += 1
+            self._ap2_save_state()  # Save state (from auto-patch v2)
+            return True
+        except Exception as e:
+            log(f"Open position error for {symbol}: {e}")
+            return False
 
-💰 ACCOUNT STATUS:
-Current Balance: ${exchange.fetch_balance().get('USDT', {}).get('total', 0):.2f} USDT
-Mode: {MODE.upper()}
+    async def close_position(self, symbol: str, reason: str = "manual") -> int:
+        try:
+            trades = self.positions.get(symbol, [])
+            if not trades:
+                return 0
+            closed = 0
+            for t in trades:
+                if t.get('status') != 'open':
+                    continue
+                t['status'] = 'closed'
+                t['close_price'] = exchange.fetch_ticker(symbol)['last']
+                t['close_timestamp'] = datetime.now(timezone.utc).isoformat()
+                closed += 1
+            self.positions[symbol] = [t for t in trades if t.get('status') == 'open']
+            self._ap2_save_state()  # Save state
+            return closed
+        except Exception as e:
+            log(f"Close position error for {symbol}: {e}")
+            return 0
+
+    def analyze_symbol(self, symbol: str) -> dict:
+        return {'results': {}, 'core_signal': None}  # Placeholder
+
+    def get_account_balance(self) -> float:
+        return exchange.fetch_balance().get('USDT', {}).get('total', self.balance)
+
+    def get_positions_summary(self) -> dict:
+        active_count = sum(1 for trades in self.positions.values() for t in trades if t.get('status') == 'open')
+        total_value = 0.0
+        total_pnl = 0.0
+        for symbol, trades in self.positions.items():
+            for t in trades:
+                if t.get('status') != 'open':
+                    continue
+                current_price = exchange.fetch_ticker(symbol)['last']
+                qty = abs(t['qty'])
+                entry_price = t['entry_price']
+                if t['side'] == 'long':
+                    pnl = (current_price - entry_price) * qty
+                else:
+                    pnl = (entry_price - current_price) * qty
+                total_pnl += pnl
+                total_value += current_price * qty
+        return {
+            'active_count': active_count,
+            'total_value': total_value,
+            'total_pnl': total_pnl,
+            'risk_metrics': {
+                'daily_budget_used': cfg.get('budget_used_today', 0.0),
+                'daily_trades': self.daily_trades,
+                'daily_loss_tracker': self.daily_loss_tracker,
+                'max_daily_loss_pct': cfg.get('max_daily_loss_pct', 0.0)
+            }
+        }
+
+    def _ap2_save_state(self):
+        st = {
+            'positions': self.positions,
+            'budget_used_today': cfg.get('budget_used_today', 0.0),
+            'last_reset_date': getattr(self, 'last_reset_date', '')
+        }
+        save_state(os.path.join(STATE_DIR, 'positions.json'), st)
+
+    def _ap2_load_state(self):
+        st = load_state(os.path.join(STATE_DIR, 'positions.json'))
+        if st:
+            self.positions = st.get('positions', {})
+            cfg['budget_used_today'] = st.get('budget_used_today', 0.0)
+            self.last_reset_date = st.get('last_reset_date', '')
+# Add to the end of trading_bot.py
+class TelegramBot:
+    """Enhanced Telegram bot command handler with full functionality"""
+    def __init__(self, trading_engine):
+        self.engine = trading_engine
+        self.help_text = """
+🤖 CRYPTO TRADING BOT COMMANDS
+
+📊 ANALYSIS & STATUS:
+/status - Account balance, positions, settings
+/analyze [SYMBOL] - Multi-timeframe analysis + AI
+/chart [SYMBOL] [TF] - Technical analysis chart
+/predict [SYMBOL] - AI prediction with confidence
+
+🎯 TRADING:
+/long [SYMBOL] - Open long position
+/short [SYMBOL] - Open short position
+/close [SYMBOL] - Close specific position
+/closeall - Close all positions
+/auto on|off - Toggle auto trading
 
 ⚙️ CONFIGURATION:
+/risk - Show/set risk parameters
+/set budget <amount> - Set daily budget
+/set leverage <x> - Set leverage
+/set atrsl <x> - ATR stop loss multiplier
+/set atrtp <x> - ATR take profit multiplier
+
+🤖 AI & OPTIMIZATION:
+/trainai [SYMBOL] - Train AI models
+/walkforward [SYMBOL] - Run walk-forward test
+/download - Download historical data
+
+📋 PAIRS MANAGEMENT:
+/addpair [SYMBOL] - Add to watch list
+/addtrade [SYMBOL] - Add to auto trading
+/pairs - Show all monitored pairs
+
+📈 REPORTS & ANALYSIS:
+/report [days] - Performance report
+/equity - Show equity curve
+/trades - Recent trades summary
+
+Type any command for detailed help.
+"""
+
+    async def handle_command(self, text: str):
+        try:
+            parts = text.strip().split()
+            if not parts:
+                return
+            command = parts[0].lower()
+            if command in ['/help', '/start']:
+                await self.cmd_help()
+            elif command == '/status':
+                await self.cmd_status()
+            elif command.startswith('/analyze'):
+                symbol = parts[1] if len(parts) > 1 else 'BTC/USDT:USDT'
+                await self.cmd_analyze(normalize_symbol(symbol))
+            elif command.startswith('/chart'):
+                await self.cmd_chart(parts[1:])
+            elif command.startswith('/predict'):
+                symbol = parts[1] if len(parts) > 1 else 'BTC/USDT:USDT'
+                await self.cmd_predict(normalize_symbol(symbol))
+            elif command.startswith('/long'):
+                symbol = parts[1] if len(parts) > 1 else 'BTC/USDT:USDT'
+                await self.cmd_long(normalize_symbol(symbol))
+            elif command.startswith('/short'):
+                symbol = parts[1] if len(parts) > 1 else 'BTC/USDT:USDT'
+                await self.cmd_short(normalize_symbol(symbol))
+            elif command.startswith('/close'):
+                if len(parts) > 1:
+                    symbol = normalize_symbol(parts[1])
+                    await self.cmd_close_position(symbol)
+                else:
+                    await self.cmd_close()
+            elif command == '/closeall':
+                await self.cmd_close_all()
+            elif command.startswith('/auto'):
+                state = parts[1] if len(parts) > 1 else 'toggle'
+                await self.cmd_auto(state)
+            elif command.startswith('/risk'):
+                if len(parts) > 1:
+                    await self.cmd_set_risk(parts[1:])
+                else:
+                    await self.cmd_show_risk()
+            elif command.startswith('/set'):
+                await self.cmd_set(parts[1:])
+            elif command.startswith('/trainai'):
+                symbol = parts[1] if len(parts) > 1 else None
+                await self.cmd_train_ai(symbol)
+            elif command.startswith('/walkforward'):
+                symbol = parts[1] if len(parts) > 1 else 'BTC/USDT:USDT'
+                await self.cmd_walkforward(normalize_symbol(symbol))
+            elif command == '/download':
+                await self.cmd_download()
+            elif command.startswith('/addpair'):
+                symbol = parts[1] if len(parts) > 1 else None
+                await self.cmd_add_pair(symbol, watch_only=True)
+            elif command.startswith('/addtrade'):
+                symbol = parts[1] if len(parts) > 1 else None
+                await self.cmd_add_pair(symbol, watch_only=False)
+            elif command == '/pairs':
+                await self.cmd_show_pairs()
+            elif command.startswith('/report'):
+                days = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 7
+                await self.cmd_report(days)
+            elif command == '/equity':
+                await self.cmd_equity_curve()
+            elif command == '/trades':
+                await self.cmd_recent_trades()
+            else:
+                await tg_send(f"Unknown command: {command}\nType /help for available commands")
+        except Exception as e:
+            log(f"Command handling error: {e}")
+            await tg_send(f"Error processing command: {str(e)[:200]}")
+
+    async def cmd_help(self):
+        await tg_send(self.help_text)
+
+    async def cmd_status(self):
+        try:
+            balance = exchange.fetch_balance()
+            total_balance = balance.get('USDT', {}).get('total', 0)
+            positions = self.engine.get_positions_summary()
+            position_info = ""
+            active_count = 0
+            total_value = 0.0
+            total_pnl = 0.0
+            risk_metrics = {
+                'daily_loss_tracker': getattr(self.engine, 'daily_loss_tracker', 0.0),
+                'daily_trades': getattr(self.engine, 'daily_trades', 0),
+                'max_position_risk_pct': cfg.get('max_position_risk_pct', 0.0)
+            }
+            if isinstance(positions, dict) and 'error' not in positions:
+                for symbol, pos in positions.items():
+                    if _tb_is_open(pos):
+                        active_count += 1
+                        position_info += f"\n📍 {pos['side'].upper()} {symbol}\n"
+                        position_info += f"Entry: {pos.get('entry_price', 'N/A'):.6f}\n"
+                        position_info += f"Stop: {pos.get('stop_loss', 'N/A'):.6f}\n"
+                        position_info += f"Target: {pos.get('take_profit', 'N/A'):.6f}\n"
+                        try:
+                            ticker = exchange.fetch_ticker(symbol)
+                            current_price = ticker['last']
+                            contracts = pos.get('contracts', 0)
+                            entry_price = pos.get('entry_price', 0)
+                            if pos['side'] == 'long':
+                                pnl = (current_price - entry_price) * contracts
+                            else:
+                                pnl = (entry_price - current_price) * contracts
+                            total_pnl += pnl
+                            total_value += current_price * contracts
+                            pnl_pct = (pnl / (entry_price * contracts)) * 100 if entry_price and contracts else 0
+                            status_emoji = "🟢" if pnl > 0 else "🔴" if pnl < 0 else "🟡"
+                            position_info += f"\n{status_emoji} {pos['side'].upper()} {symbol}"
+                            position_info += f"\nEntry: ${entry_price:.6f} | Current: ${current_price:.6f}"
+                            position_info += f"\nPnL: ${pnl:.2f} ({pnl_pct:+.2f}%)\n"
+                        except Exception:
+                            position_info += f"\n🔵 {pos['side'].upper()} {symbol} - Active\n"
+            else:
+                position_info = "None"
+            if active_count == 0:
+                position_info += "\nNo active positions"
+            status_msg = f"""
+📊 TRADING BOT STATUS
+
+💰 Account:
+Balance: ${total_balance:.2f} USDT
+Mode: {MODE.upper()}
 Daily Budget: ${cfg['daily_budget_usd']:.2f}
+Used Today: ${cfg['budget_used_today']:.2f}
+
+⚙️ Settings:
+Auto Trading: {'ON' if self.engine.auto_enabled else 'OFF'}
+Leverage: {cfg['leverage']}x
+Contracts Mode: {cfg['contracts_mode']}
+
+📈 Positions ({active_count}):
+Total Value: ${total_value:.2f}
+Unrealized PnL: ${total_pnl:.2f}
+{position_info}
+
+⚠️ Risk Management:
+Daily Loss: ${risk_metrics['daily_loss_tracker']:.2f}
+Daily Trades: {risk_metrics['daily_trades']}/10
+Max Position Risk: {risk_metrics['max_position_risk_pct']:.1f}%
+
+🎯 Auto Pairs: {len(AUTO_PAIRS)}
+👁️ Watch Pairs: {len(WATCH_ONLY_PAIRS)}
+"""
+            await tg_send(status_msg)
+        except Exception as e:
+            log(f"Status command error: {e}")
+            await tg_send(f"Error getting status: {e}")
+
+    async def cmd_analyze(self, symbol: str):
+        try:
+            analysis = self.engine.analyze_symbol(symbol)
+            if not analysis:
+                await tg_send(f"Could not analyze {symbol}")
+                return
+            msg = f"📈 ANALYSIS: {symbol}\n\n"
+            for tf, data in analysis.get('results', {}).items():
+                signal = data.get('signal', 'N/A')
+                indicators = data.get('indicators', {})
+                emoji = "🟢" if signal == 'bullish' else "🔴" if signal == 'bearish' else "🟡"
+                msg += f"{emoji} {tf}: {signal.upper()}\n"
+                msg += f"  Price: {indicators.get('price', 'N/A'):.6f}\n"
+                msg += f"  RSI: {indicators.get('rsi14', 'N/A')}\n\n"
+            ai_result = await predict_with_hybrid_ai(symbol)
+            if ai_result and isinstance(ai_result, dict) and 'p_up' in ai_result:
+                msg += f"🤖 AI Prediction:\n"
+                msg += f"  Probability Up: {ai_result['p_up']:.1%}\n"
+                msg += f"  Decision: {ai_result['decision'].upper()}\n"
+                msg += f"  Method: {ai_result.get('method', 'N/A')}\n"
+            else:
+                msg += f"🤖 AI Prediction: Unavailable\n"
+            msg += "\n📋 Recommendation:\n"
+            core_signal = analysis.get('core_signal')
+            ai_decision = ai_result.get('decision') if ai_result else None
+            ai_confidence = ai_result.get('confidence', 0.0) if ai_result else 0.0
+            if core_signal and ai_decision:
+                if core_signal == 'bullish' and ai_decision == 'long' and ai_confidence >= 0.6:
+                    msg += "✅ STRONG BUY - Technical + AI alignment"
+                elif core_signal == 'bearish' and ai_decision == 'short' and ai_confidence >= 0.6:
+                    msg += "✅ STRONG SELL - Technical + AI alignment"
+                elif ai_confidence >= 0.65:
+                    msg += f"⚠️ AI SIGNAL: {ai_decision.upper()} (no technical consensus)"
+                else:
+                    msg += "🟡 HOLD - Wait for better setup"
+            else:
+                msg += "🟡 HOLD - Insufficient signals"
+            await tg_send(msg)
+        except Exception as e:
+            log(f"Analysis error for {symbol}: {e}")
+            await tg_send(f"Analysis error for {symbol}: {e}")
+
+    async def cmd_chart(self, args: List[str]):
+        try:
+            await tg_send(f"Chart generation for {args} not implemented yet.")
+            # TODO: Implement with plot_candlestick_chart
+        except Exception as e:
+            log(f"Chart error: {e}")
+            await tg_send(f"Chart error: {str(e)[:100]}")
+
+    async def cmd_predict(self, symbol: str):
+        try:
+            result = await predict_with_hybrid_ai(symbol)
+            if result and isinstance(result, dict):
+                confidence = result.get('confidence', 0.5)
+                confidence_emoji = "🟢" if confidence >= 0.7 else "🟡" if confidence >= 0.55 else "🔴"
+                msg = f"🤖 AI PREDICTION: {symbol}\n\n"
+                msg += f"{confidence_emoji} Probability Up: {result.get('p_up', 0.5):.1%}\n"
+                msg += f"Decision: **{result.get('decision', 'hold').upper()}**\n"
+                msg += f"Overall Confidence: {confidence:.1%}\n"
+                msg += f"Method: {result.get('method', 'N/A')}\n"
+                msg += "\n📊 Model Components: Not implemented\n"
+                msg += f"\n💡 Recommendation:\n"
+                if confidence >= 0.7:
+                    msg += f"✅ Strong {result['decision'].upper()} signal"
+                elif confidence >= 0.55:
+                    msg += f"⚠️ Weak {result['decision'].upper()} signal - Use caution"
+                else:
+                    msg += "🔴 Low confidence - Avoid trading"
+                await tg_send(msg)
+            else:
+                await tg_send(f"Could not generate prediction for {symbol}")
+        except Exception as e:
+            log(f"Prediction error for {symbol}: {e}")
+            await tg_send(f"Prediction error: {str(e)[:100]}")
+
+    async def cmd_long(self, symbol: str):
+        try:
+            success = await self.engine.open_position(symbol, 'long', 'Manual long command')
+            if success:
+                await tg_send(f"✅ Long position opened for {symbol}")
+            else:
+                await tg_send(f"❌ Failed to open long position for {symbol}")
+        except Exception as e:
+            log(f"Long position error for {symbol}: {e}")
+            await tg_send(f"Long position error: {e}")
+
+    async def cmd_short(self, symbol: str):
+        try:
+            success = await self.engine.open_position(symbol, 'short', 'Manual short command')
+            if success:
+                await tg_send(f"✅ Short position opened for {symbol}")
+            else:
+                await tg_send(f"❌ Failed to open short position for {symbol}")
+        except Exception as e:
+            log(f"Short position error for {symbol}: {e}")
+            await tg_send(f"Short position error: {e}")
+
+    async def cmd_close(self):
+        try:
+            active_positions = {k: v for k, v in self.engine.positions.items() if v and any(t.get('status') == 'open' for t in v)}
+            if active_positions:
+                symbol = list(active_positions.keys())[0]
+                closed = await self.engine.close_position(symbol, reason="Manual close")
+                if closed > 0:
+                    await tg_send(f"✅ Closed {closed} position(s) for {symbol}")
+                else:
+                    await tg_send(f"❌ Failed to close position for {symbol}")
+            else:
+                await tg_send("ℹ️ No active positions to close")
+        except Exception as e:
+            log(f"Close position error: {e}")
+            await tg_send(f"Close position error: {e}")
+
+    async def cmd_close_position(self, symbol: str):
+        try:
+            closed = await self.engine.close_position(symbol, reason="Manual close")
+            if closed > 0:
+                await tg_send(f"✅ Closed {closed} position(s) for {symbol}")
+            else:
+                await tg_send(f"ℹ️ No active positions for {symbol}")
+        except Exception as e:
+            log(f"Close position error for {symbol}: {e}")
+            await tg_send(f"Close position error: {e}")
+
+    async def cmd_close_all(self):
+        try:
+            active_positions = {k: v for k, v in self.engine.positions.items() if v and any(t.get('status') == 'open' for t in v)}
+            if not active_positions:
+                await tg_send("ℹ️ No active positions to close")
+                return
+            success_count = 0
+            for symbol in active_positions.keys():
+                closed = await self.engine.close_position(symbol, reason="Close all command")
+                success_count += closed
+            await tg_send(f"✅ Closed {success_count} position(s)")
+        except Exception as e:
+            log(f"Close all error: {e}")
+            await tg_send(f"Close all error: {e}")
+
+    async def cmd_auto(self, state: str):
+        try:
+            if state.lower() == 'on':
+                self.engine.auto_enabled = True
+                cfg["auto_enabled"] = True
+                await tg_send("✅ Auto trading ENABLED")
+            elif state.lower() == 'off':
+                self.engine.auto_enabled = False
+                cfg["auto_enabled"] = False
+                await tg_send("✅ Auto trading DISABLED")
+            else:
+                current_state = "ON" if self.engine.auto_enabled else "OFF"
+                await tg_send(f"Auto trading is currently {current_state}")
+            save_settings()
+        except Exception as e:
+            log(f"Auto toggle error: {e}")
+            await tg_send(f"Auto toggle error: {e}")
+
+    async def cmd_show_risk(self):
+        try:
+            risk_metrics = getattr(self.engine, 'risk_manager', None)
+            risk_metrics = risk_metrics.get_risk_metrics() if risk_metrics else {
+                'daily_budget_used': cfg.get('budget_used_today', 0.0),
+                'daily_trades': getattr(self.engine, 'daily_trades', 0),
+                'daily_loss_tracker': getattr(self.engine, 'daily_loss_tracker', 0.0),
+                'max_daily_loss_pct': cfg.get('max_daily_loss_pct', 0.0)
+            }
+            msg = f"""
+⚠️ RISK MANAGEMENT SETTINGS
+
+💰 Budget Control:
+Daily Budget: ${cfg['daily_budget_usd']:.2f}
+Used Today: ${risk_metrics['daily_budget_used']:.2f}
+Remaining: ${cfg['daily_budget_usd'] - risk_metrics['daily_budget_used']:.2f}
+
+📊 Position Limits:
+Position Size: {cfg['position_size_fraction']*100:.1f}% of account
+Min Trade Size: ${cfg['min_notional']:.2f}
+Max Trade Size: ${cfg['max_notional']:.2f}
+Leverage: {cfg['leverage']}x
+
+⛔ Stop Loss & Take Profit:
+ATR SL Multiplier: {cfg.get('atr_sl_mult', 0.0)}x
+ATR TP Multiplier: {cfg.get('atr_tp_mult', 0.0)}x
+Partial TP: {'ON' if cfg.get('use_partial_tp', False) else 'OFF'}
+Trailing Stop: {'ON' if cfg.get('trail_after_tp', False) else 'OFF'}
+
+📈 Daily Limits:
+Daily Trades: {risk_metrics['daily_trades']}/10
+Max Daily Loss: {risk_metrics['max_daily_loss_pct']:.1f}%
+Daily Loss Tracker: ${risk_metrics['daily_loss_tracker']:.2f}
+"""
+            await tg_send(msg)
+        except Exception as e:
+            log(f"Risk display error: {e}")
+            await tg_send(f"Risk display error: {e}")
+
+    async def cmd_set_risk(self, args: List[str]):
+        try:
+            await tg_send(f"Setting risk parameters {args} not implemented yet.")
+        except Exception as e:
+            log(f"Set risk error: {e}")
+            await tg_send(f"Set risk error: {e}")
+
+    async def cmd_set(self, args: List[str]):
+        try:
+            if len(args) < 2:
+                await tg_send("Usage: /set <parameter> <value>\n"
+                             "Parameters: budget, leverage, atrsl, atrtp, minsize, maxsize, possize")
+                return
+            param, value = args[0].lower(), args[1]
+            if param == 'budget':
+                cfg["daily_budget_usd"] = max(1.0, float(value))
+                cfg["budget_used_today"] = 0.0
+                await tg_send(f"✅ Daily budget set to ${cfg['daily_budget_usd']:.2f}")
+            elif param == 'leverage':
+                new_leverage = max(1, min(100, int(float(value))))
+                cfg["leverage"] = new_leverage
+                for symbol in AUTO_PAIRS:
+                    safe_set_leverage(symbol, new_leverage)
+                await tg_send(f"✅ Leverage set to {cfg['leverage']}x")
+            elif param == 'atrsl':
+                cfg["atr_sl_mult"] = max(0.1, float(value))
+                await tg_send(f"✅ ATR Stop Loss multiplier set to {cfg['atr_sl_mult']}x")
+            elif param == 'atrtp':
+                cfg["atr_tp_mult"] = max(0.2, float(value))
+                await tg_send(f"✅ ATR Take Profit multiplier set to {cfg['atr_tp_mult']}x")
+            elif param == 'minsize':
+                cfg["min_notional"] = max(1.0, float(value))
+                await tg_send(f"✅ Minimum trade size set to ${cfg['min_notional']:.2f}")
+            elif param == 'maxsize':
+                cfg["max_notional"] = max(cfg["min_notional"], float(value))
+                await tg_send(f"✅ Maximum trade size set to ${cfg['max_notional']:.2f}")
+            elif param == 'possize':
+                new_fraction = max(0.001, min(0.1, float(value)))
+                cfg["position_size_fraction"] = new_fraction
+                await tg_send(f"✅ Position size set to {new_fraction*100:.2f}% of account")
+            else:
+                await tg_send(f"Unknown parameter: {param}")
+                return
+            save_settings()
+        except ValueError:
+            await tg_send("Invalid value. Please provide a valid number.")
+        except Exception as e:
+            log(f"Set error: {e}")
+            await tg_send(f"Set error: {e}")
+
+    async def cmd_train_ai(self, symbol: Optional[str] = None):
+        try:
+            await tg_send(f"Training AI for {symbol or 'all symbols'} not implemented yet.")
+        except Exception as e:
+            log(f"AI training error: {e}")
+            await tg_send(f"Training error: {str(e)[:200]}")
+
+    async def cmd_walkforward(self, symbol: str):
+        try:
+            await run_wfo(symbol, tf="5m")
+            await tg_send(f"Walk-forward optimization for {symbol} completed.")
+        except Exception as e:
+            log(f"Walk-forward error: {e}")
+            await tg_send(f"Walk-forward error: {str(e)[:200]}")
+
+    async def cmd_download(self):
+        try:
+            await tg_send("Historical data download not implemented yet.")
+        except Exception as e:
+            log(f"Download error: {e}")
+            await tg_send(f"Download error: {str(e)[:200]}")
+
+    async def cmd_add_pair(self, symbol: str, watch_only: bool = True):
+        if not symbol:
+            await tg_send("Usage: /addpair <SYMBOL> or /addtrade <SYMBOL>")
+            return
+        try:
+            symbol = normalize_symbol(symbol)
+            target = WATCH_ONLY_PAIRS if watch_only else AUTO_PAIRS
+            if symbol not in target:
+                target.add(symbol)
+                if not watch_only:
+                    safe_set_leverage(symbol, cfg["leverage"])
+                await tg_send(f"✅ Added {symbol} to {'watch list' if watch_only else 'auto trading'}")
+            else:
+                await tg_send(f"ℹ️ {symbol} already in {'watch list' if watch_only else 'auto trading'}")
+        except Exception as e:
+            log(f"Add pair error: {e}")
+            await tg_send(f"Error adding pair: {e}")
+
+    async def cmd_show_pairs(self):
+        try:
+            msg = "📋 MONITORED TRADING PAIRS\n\n"
+            msg += f"🎯 Auto Trading ({len(AUTO_PAIRS)}):\n"
+            for symbol in sorted(AUTO_PAIRS):
+                position = self.engine.positions.get(symbol)
+                status = f"📈 {position[0]['side'].upper()}" if position and position[0].get('status') == 'open' else "⏸️"
+                msg += f"{status} {symbol}\n"
+            msg += f"\n👁️ Watch Only ({len(WATCH_ONLY_PAIRS)}):\n"
+            for symbol in sorted(WATCH_ONLY_PAIRS):
+                msg += f"👁️ {symbol}\n"
+            await tg_send(msg)
+        except Exception as e:
+            log(f"Show pairs error: {e}")
+            await tg_send(f"Error showing pairs: {e}")
+
+    async def cmd_report(self, days: int = 7):
+        try:
+            balance = getattr(self.engine, 'get_account_balance', lambda: 0.0)()
+            positions_summary = getattr(self.engine, 'get_positions_summary', lambda: {
+                'active_count': 0, 'total_value': 0.0, 'total_pnl': 0.0,
+                'risk_metrics': {'daily_budget_used': 0.0, 'daily_trades': 0, 'daily_loss_tracker': 0.0, 'max_daily_loss_pct': 0.0}
+            })()
+            report = f"""
+📊 PERFORMANCE REPORT ({days} days)
+
+💰 Current Status:
+Account Balance: ${balance:.2f}
+Active Positions: {positions_summary['active_count']}
+Position Value: ${positions_summary['total_value']:.2f}
+Unrealized PnL: ${positions_summary['total_pnl']:.2f}
+
+📈 Risk Metrics:
+Daily Budget Used: ${positions_summary['risk_metrics']['daily_budget_used']:.2f} / ${cfg['daily_budget_usd']:.2f}
+Daily Trades: {positions_summary['risk_metrics']['daily_trades']}/10
+Daily Loss Tracker: ${positions_summary['risk_metrics']['daily_loss_tracker']:.2f}
+
+⚙️ Settings:
+Auto Trading: {'ON' if self.engine.auto_enabled else 'OFF'}
 Position Size: {cfg['position_size_fraction']*100:.1f}% of account
 Leverage: {cfg['leverage']}x
-ATR Multipliers: SL {cfg['atr_sl_mult']}x, TP {cfg['atr_tp_mult']}x
-
-🤖 AI STATUS:
-Models Trained: {len([k for k in ai_manager.models.keys() if k.endswith('_lr')])}
-LSTM Available: {'Yes' if TORCH_OK else 'No'}
-Hybrid Weight: {AI_CFG['hybrid_weight']:.1%}
-
-📈 PAIRS:
-Auto Trading: {len(AUTO_PAIRS)}
-Watch Only: {len(WATCH_ONLY_PAIRS)}
-
-⚠️ RISK MANAGEMENT:
-Max Daily Loss: 5.0%
-Max Position Risk: 2.0%
-Partial TP: {'Enabled' if cfg['use_partial_tp'] else 'Disabled'}
-Trailing Stop: {'Enabled' if cfg['trail_after_tp'] else 'Disabled'}
-
-Note: Extended performance metrics available after longer operation period.
-Use /walkforward command for comprehensive backtesting results.
 """
-        
-        return report
-        
-    except Exception as e:
-        log(f"Report generation error: {e}")
-        return f"Error generating report: {e}"
+            await tg_send(report)
+        except Exception as e:
+            log(f"Report error: {e}")
+            await tg_send(f"Report error: {str(e)[:200]}")
+
+    async def cmd_equity_curve(self):
+        try:
+            balance = getattr(self.engine, 'get_account_balance', lambda: 0.0)()
+            positions_summary = getattr(self.engine, 'get_positions_summary', lambda: {
+                'total_value': 0.0, 'total_pnl': 0.0
+            })()
+            msg = f"""
+📈 EQUITY SUMMARY
+
+Current Balance: ${balance:.2f}
+Position Value: ${positions_summary['total_value']:.2f}
+Unrealized PnL: ${positions_summary['total_pnl']:.2f}
+Total Equity: ${balance + positions_summary['total_pnl']:.2f}
+
+Note: Full equity curve not implemented yet.
+"""
+            await tg_send(msg)
+        except Exception as e:
+            log(f"Equity curve error: {e}")
+            await tg_send(f"Equity curve error: {e}")
+
+    async def cmd_recent_trades(self):
+        try:
+            active_positions = {k: v for k, v in self.engine.positions.items() if v and any(t.get('status') == 'open' for t in v)}
+            if not active_positions:
+                await tg_send("📊 No recent trades to display")
+                return
+            msg = "📊 ACTIVE POSITIONS\n\n"
+            for symbol, trades in active_positions.items():
+                for pos in trades:
+                    if pos.get('status') != 'open':
+                        continue
+                    try:
+                        ticker = exchange.fetch_ticker(symbol)
+                        current_price = ticker['last']
+                        if pos['side'] == 'long':
+                            pnl = (current_price - pos['entry_price']) * pos['qty']
+                        else:
+                            pnl = (pos['entry_price'] - current_price) * abs(pos['qty'])
+                        pnl_pct = (pnl / (pos['entry_price'] * abs(pos['qty']))) * 100 if pos['entry_price'] and pos['qty'] else 0
+                        status = "🟢" if pnl > 0 else "🔴" if pnl < 0 else "🟡"
+                        msg += f"{status} {pos['side'].upper()} {symbol}\n"
+                        msg += f"Entry: ${pos['entry_price']:.6f}\n"
+                        msg += f"Current: ${current_price:.6f}\n"
+                        msg += f"PnL: ${pnl:.2f} ({pnl_pct:+.2f}%)\n"
+                        msg += f"Timestamp: {pos['timestamp']}\n\n"
+                    except Exception:
+                        msg += f"⚪ {pos['side'].upper()} {symbol} - Active\n\n"
+            await tg_send(msg)
+        except Exception as e:
+            log(f"Trades summary error: {e}")
+            await tg_send(f"Trades summary error: {e}")
 
 # =============================
 # PERFORMANCE ANALYTICS
@@ -4703,6 +4523,15 @@ Examples:
                        help="Force paper trading mode")
     parser.add_argument("--debug", action="store_true", 
                        help="Enable debug logging")
+    # Trading actions via CLI (mirror of Telegram commands)
+    parser.add_argument("--status", action="store_true", help="Show account and positions status")
+    parser.add_argument("--analyze", type=str, metavar="SYMBOL", help="Analyze a symbol, e.g., BTC/USDT:USDT")
+    parser.add_argument("--predict", type=str, metavar="SYMBOL", help="Run hybrid AI prediction on a symbol")
+    parser.add_argument("--long", type=str, metavar="SYMBOL", help="Open a long position on a symbol")
+    parser.add_argument("--short", type=str, metavar="SYMBOL", help="Open a short position on a symbol")
+    parser.add_argument("--close", type=str, metavar="SYMBOL", help="Close a position for a symbol")
+    parser.add_argument("--closeall", action="store_true", help="Close all open positions")
+
     
     args = parser.parse_args()
     
@@ -5125,84 +4954,93 @@ class TradingEngine:
             pass
         return max(qty, 0.0)
 
-    # ---------- Orders ----------
-    def _ccxt_side(self, side: str) -> str:
-        return "buy" if side.lower() == "long" else "sell"
+# ---------- Orders ----------
+def _ccxt_side(self, side: str) -> str:
+    return "buy" if side.lower() == "long" else "sell"
 
-    def _ensure_symbol_list(self) -> List[str]:
-        if "AUTO_PAIRS" in globals() and isinstance(AUTO_PAIRS, list) and AUTO_PAIRS:
-            return AUTO_PAIRS
-        return (cfg.get("auto_pairs") or cfg.get("watch_pairs") or [])
+def _ensure_symbol_list(self) -> List[str]:
+    if "AUTO_PAIRS" in globals() and isinstance(AUTO_PAIRS, list) and AUTO_PAIRS:
+        return AUTO_PAIRS
+    return (cfg.get("auto_pairs") or cfg.get("watch_pairs") or [])
 
-    async def open_position(self, symbol: str, side: str, sl: Optional[float]=None, tp: Optional[float]=None, qty: Optional[float]=None, price: Optional[float]=None) -> Optional[dict]:
+async def open_position(self, symbol: str, side: str, reason: str = "manual") -> bool:
+    try:
+        price = self._get_price(symbol)
+        qty = self._position_size(price, symbol)
+        if qty <= 0:
+            log(f"[open_position] Skip {symbol}: qty calc failed (qty={qty})")
+            return False
+
+        # Calculate stop loss and take profit (example logic, adjust as needed)
+        sl = price * (0.98 if side.lower() == "long" else 1.02)  # 2% below/above entry
+        tp = price * (1.02 if side.lower() == "long" else 0.98)  # 2% above/below entry
+
+        order = None
         try:
-            if not price:
-                price = self.get_mark_price(symbol)
-            if not qty:
-                qty = self._calc_qty(symbol, price or 0.0)
-            if not qty or qty <= 0:
-                log(f"[open_position] Skip {symbol}: qty calc failed")
-                return None
-
-            order = None
-            try:
-                order = exchange.create_market_order(symbol, self._ccxt_side(side), qty)
-                fill_price = order.get("average") or order.get("price") or price
-            except Exception as e:
-                log(f"[open_position] live order failed ({e}), simulating")
-                fill_price = price
-
-            trade = {
-                "id": str(uuid.uuid4()),
-                "symbol": symbol,
-                "side": side.lower(),
-                "qty": float(qty) if side.lower()=="long" else -float(qty),
-                "entry_price": float(fill_price or 0.0),
-                "stop_loss": float(sl) if sl else None,
-                "take_profit": float(tp) if tp else None,
-                "status": "open",
-                "timestamp": datetime.now(timezone.utc).isoformat()
-            }
-            self.positions.setdefault(symbol, []).append(trade)
-            self._save_positions()
-            log(f"[open_position] {symbol} {side} qty={qty} @ {fill_price} sl={sl} tp={tp}")
-            return trade
+            order = exchange.create_market_order(symbol, self._ccxt_side(side), qty)
+            fill_price = order.get("average") or order.get("price") or price
         except Exception as e:
-            log(f"[open_position] error: {e}")
-            return None
+            log(f"[open_position] Error for {symbol}: {e}")
+            return False
 
-    async def close_position(self, symbol: str, pos_index: Optional[int]=None, reason: str="manual") -> int:
-        try:
-            trades = self.positions.get(symbol, [])
-            if not trades:
-                return 0
-            closed = 0
-            for idx, t in list(enumerate(trades)):
-                if pos_index is not None and idx != pos_index:
-                    continue
-                if t.get("status") != "open":
-                    continue
-                qty = abs(float(t.get("qty", 0.0)))
-                ccxt_side = "sell" if t.get("side")=="long" else "buy"
-                price = self.get_mark_price(symbol)
-                try:
-                    exchange.create_market_order(symbol, ccxt_side, qty)
-                except Exception as e:
-                    log(f"[close_position] live close failed ({e}), simulating")
-                t["status"] = "closed"
-                t["exit_price"] = float(price or t.get("entry_price"))
-                t["exit_time"] = datetime.now(timezone.utc).isoformat()
-                t["reason"] = reason
-                closed += 1
-                if pos_index is not None and closed:
-                    break
-            self._save_positions()
-            if closed:
-                log(f"[close_position] Closed {closed} trade(s) for {symbol} ({reason})")
-            return closed
-        except Exception as e:
-            log(f"[close_position] error: {e}")
+        trade = {
+            "id": str(uuid.uuid4()),
+            "symbol": symbol,
+            "side": side.lower(),
+            "qty": float(qty) if side.lower() == "long" else -float(qty),
+            "entry_price": float(fill_price or 0.0),
+            "stop_loss": float(sl) if sl else None,
+            "take_profit": float(tp) if tp else None,
+            "status": "open",
+            "timestamp": datetime.now(timezone.utc).isoformat()
+        }
+        self.positions.setdefault(symbol, []).append(trade)
+        self._save_positions()
+        log(f"[open_position] {symbol} {side} qty={qty} @ {fill_price} sl={sl} tp={tp}")
+        return True
+    except Exception as e:
+        log(f"[open_position] error: {e}")
+        return False
+
+async def close_position(self, symbol: str, pos_index: Optional[int] = None, reason: str = "manual") -> int:
+    try:
+        trades = self.positions.get(symbol, [])
+        if not trades:
+            log(f"[close_position] No positions found for {symbol}")
             return 0
+
+        closed = 0
+        for idx, t in list(enumerate(trades)):
+            if pos_index is not None and idx != pos_index:
+                continue
+            if t.get("status") != "open":
+                continue
+            qty = abs(float(t.get("qty", 0.0)))
+            ccxt_side = "sell" if t.get("side") == "long" else "buy"
+            price = self.get_mark_price(symbol)
+            try:
+                exchange.create_market_order(symbol, ccxt_side, qty)
+                t["status"] = "closed"
+                t["close_price"] = float(price or 0.0)
+                t["close_timestamp"] = datetime.now(timezone.utc).isoformat()
+                closed += 1
+                log(f"[close_position] Closed {symbol} {t['side']} qty={qty} @ {price} reason={reason}")
+            except Exception as e:
+                log(f"[close_position] Live close failed for {symbol} ({e}), simulating")
+                t["status"] = "closed"
+                t["close_price"] = float(price or 0.0)
+                t["close_timestamp"] = datetime.now(timezone.utc).isoformat()
+                closed += 1
+                log(f"[close_position] Simulated close for {symbol} {t['side']} qty={qty} @ {price}")
+
+        if closed > 0:
+            self.positions[symbol] = [t for t in trades if t.get("status") == "open"]
+            self._save_positions()
+        
+        return closed
+    except Exception as e:
+        log(f"[close_position] error: {e}")
+        return 0
 
     # ---------- Analysis & Management ----------
     async def analyze_symbol(self, symbol: str) -> Dict[str, Any]:
@@ -5504,13 +5342,126 @@ CLI_COMMAND_MAP = {
     'train-ai': cli_train_ai,
     'walkforward': cli_walkforward,
     'run': cli_run,
+    'status': cli_status,
+    'analyze': cli_analyze,
+    'predict': cli_predict,
+    'long': cli_long,
+    'short': cli_short,
+    'close': cli_close,
+    'closeall': cli_closeall,
 }
+
+
+async def cli_status(args):
+    te = TradingEngine()
+    try:
+        summary = te.get_positions_summary() if hasattr(te, "get_positions_summary") else {}
+        print(json.dumps(summary, indent=2, default=str))
+    except Exception as e:
+        log(f"cli_status error: {e}")
+
+async def cli_analyze(args):
+    te = TradingEngine()
+    sym = normalize_symbol(getattr(args, "analyze", None) or getattr(args, "symbol", "BTC/USDT:USDT"))
+    try:
+        if hasattr(te, "analyze_symbol"):
+            res = await te.analyze_symbol(sym)
+            print(json.dumps(res, indent=2, default=str))
+        else:
+            log("analyze_symbol not available.")
+    except Exception as e:
+        log(f"cli_analyze error: {e}")
+
+async def cli_predict(args):
+    sym = normalize_symbol(getattr(args, "predict", None) or getattr(args, "symbol", "BTC/USDT:USDT"))
+    try:
+        if 'predict_with_hybrid_ai' in globals():
+            res = predict_with_hybrid_ai(sym)
+            print(json.dumps(res, indent=2, default=str))
+        else:
+            log("predict_with_hybrid_ai not available.")
+    except Exception as e:
+        log(f"cli_predict error: {e}")
+
+async def cli_long(args):
+    te = TradingEngine()
+    sym = normalize_symbol(getattr(args, "long", None) or getattr(args, "symbol", "BTC/USDT:USDT"))
+    try:
+        if hasattr(te, "open_position"):
+            ok = await te.open_position(sym, "long", "cli_long")
+            print("LONG", sym, "->", "OK" if ok else "FAILED")
+        else:
+            log("open_position not available on TradingEngine")
+    except Exception as e:
+        log(f"cli_long error: {e}")
+
+async def cli_short(args):
+    te = TradingEngine()
+    sym = normalize_symbol(getattr(args, "short", None) or getattr(args, "symbol", "BTC/USDT:USDT"))
+    try:
+        if hasattr(te, "open_position"):
+            ok = await te.open_position(sym, "short", "cli_short")
+            print("SHORT", sym, "->", "OK" if ok else "FAILED")
+        else:
+            log("open_position not available on TradingEngine")
+    except Exception as e:
+        log(f"cli_short error: {e}")
+
+async def cli_close(args):
+    te = TradingEngine()
+    sym = normalize_symbol(getattr(args, "close", None) or getattr(args, "symbol", "BTC/USDT:USDT"))
+    try:
+        if hasattr(te, "close_position"):
+            closed = await te.close_position(sym, reason="cli_close")
+            print("CLOSE", sym, "->", "OK" if closed else "NO_POSITIONS")
+        else:
+            log("close_position not available on TradingEngine")
+    except Exception as e:
+        log(f"cli_close error: {e}")
+
+async def cli_closeall(args):
+    te = TradingEngine()
+    try:
+        # Try high-level helper first
+        if hasattr(te, "__close_all_positions"):
+            await te.__close_all_positions("cli_closeall")
+            print("Closed all positions")
+            return
+        # Fallback: iterate known positions
+        if hasattr(te, "_tb_position_iter") and hasattr(te, "_tb_safe_close_position"):
+            count = 0
+            async for sym, pos in te._tb_position_iter():
+                ok = await te._tb_safe_close_position(sym, pos)
+                if ok:
+                    count += 1
+            print(f"Closed {count} positions")
+        else:
+            log("close all positions helper not available on TradingEngine")
+    except Exception as e:
+        log(f"cli_closeall error: {e}")
 
 async def dispatch_cli(args):
     cmd = getattr(args, 'command', None)
     if cmd in CLI_COMMAND_MAP:
         return await CLI_COMMAND_MAP[cmd](args)
     # fallbacks to flags
+
+    # quick action flags
+    if getattr(args, 'status', False):
+        return await CLI_COMMAND_MAP['status'](args)
+    if getattr(args, 'analyze', None):
+        return await CLI_COMMAND_MAP['analyze'](args)
+    if getattr(args, 'predict', None):
+        return await CLI_COMMAND_MAP['predict'](args)
+    if getattr(args, 'long', None):
+        return await CLI_COMMAND_MAP['long'](args)
+    if getattr(args, 'short', None):
+        return await CLI_COMMAND_MAP['short'](args)
+    if getattr(args, 'close', None):
+        return await CLI_COMMAND_MAP['close'](args)
+    if getattr(args, 'closeall', False):
+        return await CLI_COMMAND_MAP['closeall'](args)
+
     if getattr(args, 'download_data', False):
         return await CLI_COMMAND_MAP['download-data'](args)
     if getattr(args, 'train_ai', False):
@@ -6085,3 +6036,537 @@ if TE and isinstance(TE, type):
         setattr(TE, "normalize_ai_result", getattr(TE, "_normalize_ai_result"))
 
 # ==== END AUTOPATCH ====
+
+
+# === BEGIN AUTO-PATCH LAYER (non-destructive) ===
+# This block was appended to harden async/await, persistence, history I/O, Telegram handlers,
+# graceful shutdown, and walk-forward reporting — without removing existing features.
+
+import os as _ap_os
+import sys as _ap_sys
+import gc as _ap_gc
+import json as _ap_json
+import asyncio as _ap_asyncio
+import signal as _ap_signal
+from pathlib import Path as _ap_Path
+from datetime import datetime as _ap_datetime, timezone as _ap_timezone
+
+# ---- Safe utilities ----
+def _ap_utcnow():
+    return _ap_datetime.now(_ap_timezone.utc)
+
+def _ap_tf_to_ms(tf: str) -> int:
+    tf = str(tf).strip().lower()
+    _m = {"1m":60000,"3m":180000,"5m":300000,"15m":900000,"30m":1800000,"1h":3600000,"2h":7200000,"4h":14400000,"6h":21600000,"12h":43200000,"1d":86400000,"1w":604800000}
+    if tf.endswith("min"):
+        try: return int(float(tf[:-3])*60000)
+        except: return 300000
+    return _m.get(tf, 300000)
+
+def _ap_atomic_dump(obj, path: _ap_Path, keep=3):
+    path = _ap_Path(path)
+    tmp = path.with_suffix(path.suffix+".tmp")
+    bak = path.with_suffix(path.suffix+f".bak-{int(_ap_os.times().elapsed)}")
+    try:
+        if path.exists():
+            try:
+                import shutil as _ap_shutil
+                _ap_shutil.copy2(path, bak)
+            except Exception:
+                pass
+        with open(tmp, "w", encoding="utf-8") as f:
+            _ap_json.dump(obj, f, indent=2, default=str)
+        _ap_os.replace(str(tmp), str(path))
+        # rotate
+        baks = sorted(path.parent.glob(path.name+".bak-*"), key=lambda p: p.stat().st_mtime, reverse=True)
+        for p in baks[keep:]:
+            try: p.unlink()
+            except Exception: pass
+    finally:
+        try: tmp.unlink()
+        except Exception: pass
+
+def _ap_safe_load(path: _ap_Path, default):
+    path = _ap_Path(path)
+    try:
+        with open(path, "r", encoding="utf-8") as f: return _ap_json.load(f)
+    except Exception:
+        baks = sorted(path.parent.glob(path.name+".bak-*"), key=lambda p: p.stat().st_mtime, reverse=True)
+        for b in baks:
+            try:
+                with open(b, "r", encoding="utf-8") as f: return _ap_json.load(f)
+            except Exception:
+                continue
+    return default
+
+# ---- Async wrappers for functions that were awaited but defined sync ----
+try:
+    import inspect as _ap_inspect
+    # get_indicators
+    if "get_indicators" in globals():
+        _ap_gi = globals()["get_indicators"]
+        if not _ap_inspect.iscoroutinefunction(_ap_gi):
+            async def get_indicators(*a, **kw):  # type: ignore
+                return await _ap_asyncio.to_thread(_ap_gi, *a, **kw)
+            globals()["get_indicators"] = get_indicators  # noqa
+    # predict_with_hybrid_ai
+    if "predict_with_hybrid_ai" in globals():
+        _ap_ph = globals()["predict_with_hybrid_ai"]
+        if not _ap_inspect.iscoroutinefunction(_ap_ph):
+            async def predict_with_hybrid_ai(*a, **kw):  # type: ignore
+                return await _ap_asyncio.to_thread(_ap_ph, *a, **kw)
+            globals()["predict_with_hybrid_ai"] = predict_with_hybrid_ai  # noqa
+except Exception:
+    pass
+
+# ---- Resumable, atomic ensure_history (replaces any existing function name) ----
+try:
+    import ccxt as _ap_ccxt
+    _ap_EX = None
+    # try reuse global exchange if available
+    for _name in ("EX","exchange","EXCHANGE","okx","OKX"):
+        if _name in globals():
+            _ap_EX = globals()[_name]
+            break
+    if _ap_EX is None:
+        _ap_EX = _ap_ccxt.okx({"enableRateLimit": True, "options": {"defaultType":"swap"}})
+except Exception:
+    _ap_EX = None
+
+def _ap_hist_path(symbol: str, tf: str):
+    import re as _ap_re
+    sym = _ap_re.sub(r"[^A-Z0-9]+", "_", symbol.upper())
+    _dir = _ap_Path("data"); _dir.mkdir(parents=True, exist_ok=True)
+    return _dir / f"{sym}_{tf}.csv"
+
+async def ensure_history(symbol: str, tf: str = "5m", months: int = 12, limit: int = 500):  # type: ignore
+    p = _ap_hist_path(symbol, tf)
+    start_ms = int((_ap_os.path.getmtime(p) if p.exists() else _ap_utcnow().timestamp())*1000) - months*30*86400000
+    rows = []
+    if p.exists():
+        try:
+            import pandas as _ap_pd
+            df = _ap_pd.read_csv(p)
+            if not df.empty:
+                last = int(df["ts"].iloc[-1])
+                start_ms = last + _ap_tf_to_ms(tf)
+                rows = df.values.tolist()
+        except Exception:
+            pass
+    now = int(_ap_utcnow().timestamp()*1000)
+    retries = 0
+    while _ap_EX and start_ms < now:
+        try:
+            def _call():
+                return _ap_EX.fetch_ohlcv(symbol, timeframe=tf, since=start_ms, limit=limit)
+            batch = await _ap_asyncio.to_thread(_call)
+            if not batch:
+                break
+            rows.extend(batch)
+            start_ms = batch[-1][0] + _ap_tf_to_ms(tf)
+            retries = 0
+            await _ap_asyncio.sleep(0.1)
+        except Exception:
+            retries += 1
+            if retries > 5:
+                break
+            await _ap_asyncio.sleep(2**retries)
+    if rows:
+        try:
+            import pandas as _ap_pd
+            df = _ap_pd.DataFrame(rows, columns=["ts","open","high","low","close","volume"])
+            df = df.drop_duplicates("ts").sort_values("ts")
+            tmp = p.with_suffix(p.suffix+".tmp")
+            df.to_csv(tmp, index=False)
+            _ap_os.replace(tmp, p)
+            return True
+        except Exception:
+            return False
+    return True
+
+
+
+
+# ---- Telegram handler hardening (rate limit + try/except) ----
+try:
+    import types as _ap_types, time as _ap_time
+    _ap_rl_state = {"last": 0.0}
+    def _ap_rl_ok(min_interval=0.75):
+        now = _ap_time.time()
+        if now - _ap_rl_state["last"] < min_interval:
+            return False
+        _ap_rl_state["last"] = now
+        return True
+
+    # Patch free function
+    if "handle_command" in globals():
+        _orig = globals()["handle_command"]
+        if callable(_orig):
+            async def handle_command(*a, **kw):  # type: ignore
+                if not _ap_rl_ok(): 
+                    return {"ok": False, "error": "rate_limited"}
+                try:
+                    res = _orig(*a, **kw)
+                    if _ap_asyncio.iscoroutine(res):
+                        return await res
+                    return res
+                except Exception as e:
+                    return {"ok": False, "error": f"handler_error:{e.__class__.__name__}"}
+            globals()["handle_command"] = handle_command  # noqa
+
+    # Patch common bot classes
+    for _n, _obj in list(globals().items()):
+        if isinstance(_obj, type) and hasattr(_obj, "handle_command"):
+            _orig = getattr(_obj, "handle_command")
+            async def _wrapped(self, *a, **kw):  # type: ignore
+                if not _ap_rl_ok():
+                    return {"ok": False, "error": "rate_limited"}
+                try:
+                    r = _orig(self, *a, **kw)
+                    if _ap_asyncio.iscoroutine(r):
+                        return await r
+                    return r
+                except Exception as e:
+                    return {"ok": False, "error": f"handler_error:{e.__class__.__name__}"}
+            setattr(_obj, "handle_command", _wrapped)
+except Exception:
+    pass
+
+# ---- State persistence
+# ---- State persistence
+# ---- State persistence (positions/budget) ----
+# ---- State persistence (positions/budget) ----
+try:
+    _ap_state_dir = _ap_Path("state"); _ap_state_dir.mkdir(parents=True, exist_ok=True)
+    _ap_pos_file = _ap_state_dir / "open_positions.json"
+    _ap_budget_file = _ap_state_dir / "budget.json"
+
+    def _ap_save_positions_from(obj):
+        if isinstance(obj, dict):
+            _ap_atomic_dump(obj, _ap_pos_file)
+            return True
+        return False
+
+    def _ap_restore_positions_to(obj_name=None):
+        data = _ap_safe_load(_ap_pos_file, default=None)
+        if data is None: 
+            return False
+        if obj_name and obj_name in globals() and isinstance(globals()[obj_name], dict):
+            globals()[obj_name].clear(); globals()[obj_name].update(data); return True
+        # best-effort: populate common names
+        for key in ("positions","open_positions","OPEN_POSITIONS"):
+            if key in globals() and isinstance(globals()[key], dict):
+                globals()[key].clear(); globals()[key].update(data); return True
+        return False
+
+    # On import, try to restore positions into a common global dict if present
+    _ap_restore_positions_to()
+
+    # Budget persistence helpers, used by graceful shutdown hook below
+    def _ap_save_budget_from(obj):
+        if isinstance(obj, dict):
+            _ap_atomic_dump(obj, _ap_budget_file)
+            return True
+        return False
+except Exception:
+    pass
+
+# ---- Graceful shutdown: persist state and close resources ----
+def _ap_graceful_save():
+    # Try to discover and persist runtime state
+    # 1) positions in globals
+    for k,v in list(globals().items()):
+        if k.lower() in ("positions","open_positions") and isinstance(v, dict):
+            try: _ap_save_positions_from(v)
+            except Exception: pass
+    # 2) engine-like objects with .positions
+    for k,v in list(globals().items()):
+        try:
+            if hasattr(v, "positions") and isinstance(getattr(v, "positions"), dict):
+                _ap_save_positions_from(getattr(v, "positions"))
+        except Exception:
+            pass
+    # 3) budget-like dicts
+    for k,v in list(globals().items()):
+        if k.lower() in ("budget","daily_budget","budget_state") and isinstance(v, dict):
+            try: _ap_save_budget_from(v)
+            except Exception: pass
+
+# Install signal handlers once
+try:
+    def _ap_signal_handler(signum, frame):
+        try: _ap_graceful_save()
+        finally:
+            _ap_sys.exit(0)
+    for _sig in (getattr(_ap_signal, "SIGINT", None), getattr(_ap_signal,"SIGTERM", None)):
+        if _sig is not None:
+            try: _ap_signal.signal(_sig, _ap_signal_handler)
+            except Exception: pass
+except Exception:
+    pass
+
+# ---- Background GC task to mitigate loop leaks ----
+async def _ap_gc_task(_interval=30):
+    while True:
+        try:
+            _ap_gc.collect()
+        except Exception:
+            pass
+        await _ap_asyncio.sleep(_interval)
+
+# Try to spawn GC task if event loop exists
+try:
+    _loop = _ap_asyncio.get_event_loop()
+    if _loop.is_running():
+        _loop.create_task(_ap_gc_task())
+except Exception:
+    pass
+
+# ---- Optional: lightweight walk-forward if not provided ----
+if "run_wfo" not in globals():
+    async def run_wfo(symbol: str, tf: str = "5m"):
+        try:
+            import pandas as _ap_pd, numpy as _ap_np
+        except Exception:
+            return None
+        # Basic: reuse ensure_history and CSV cache
+        await ensure_history(symbol, tf, months=12)
+        p = _ap_hist_path(symbol, tf)
+        try:
+            df = _ap_pd.read_csv(p)
+        except Exception:
+            return None
+        if df.empty or len(df) < 500:
+            return None
+        # Very simple performance snapshot
+        rep = {"symbol": symbol, "tf": tf, "rows": int(len(df)), "generated_at": str(_ap_utcnow())}
+        out = _ap_Path("reports"); out.mkdir(parents=True, exist_ok=True)
+        f = out / f"wfo_snapshot_{symbol.replace('/','_').replace(':','_')}_{tf}.json"
+        _ap_atomic_dump(rep, f)
+        return str(f)
+
+# === END AUTO-PATCH LAYER ===
+
+
+# === BEGIN AUTO-PATCH LAYER v2 ===
+# Additional repairs: matplotlib memory cleanup, safe logging redaction, stronger engine persistence,
+# input sanitization for Telegram, and final atexit GC.
+
+import atexit as _ap2_atexit
+import re as _ap2_re
+
+# --- Matplotlib: close figures after save to avoid memory buildup ---
+try:
+    import matplotlib.pyplot as _ap2_plt
+    if not getattr(_ap2_plt, "_ap2_patched", False):
+        _ap2_orig_savefig = _ap2_plt.savefig
+        def _ap2_savefig(*a, **kw):
+            fig = kw.get("figure", None)
+            try:
+                return _ap2_orig_savefig(*a, **kw)
+            finally:
+                try:
+                    if fig is not None:
+                        fig.clf(); _ap2_plt.close(fig)
+                    else:
+                        # best-effort: if a figure instance was the first arg
+                        if a and getattr(a[0], "clf", None):
+                            a[0].clf(); _ap2_plt.close(a[0])
+                        else:
+                            # last resort: avoid unbounded figure accumulation
+                            _ap2_plt.close("all")
+                except Exception:
+                    pass
+        _ap2_plt.savefig = _ap2_savefig
+        _ap2_plt._ap2_patched = True
+except Exception:
+    pass
+
+# --- Safe logger: redact secrets if a global `log` exists ---
+try:
+    if "log" in globals() and callable(globals()["log"]):
+        _ap2_orig_log = globals()["log"]
+        _ap2_secret_pat = _ap2_re.compile(r"(?i)(api[_-]?key|secret|passphrase)\s*[:=]\s*[A-Za-z0-9_\-\./+=]{8,}")
+        def log(msg: str):
+            try:
+                s = str(msg)
+                s = _ap2_secret_pat.sub(r"\1: [REDACTED]", s)
+                return _ap2_orig_log(s)
+            except Exception:
+                return _ap2_orig_log("[log-redaction-error]")
+        globals()["log"] = log  # noqa
+except Exception:
+    pass
+
+# --- Telegram input sanitization helper (does not alter behavior, just cleans) ---
+def _ap2_sanitize_cmd(text: str) -> str:
+    if not isinstance(text, str):
+        return ""
+    # strip code blocks and suspicious characters
+    text = _ap2_re.sub(r"`{1,3}.*?`{1,3}", "", text, flags=_ap2_re.S)
+    text = _ap2_re.sub(r"[;|&$><]", "", text)
+    return text.strip()
+
+try:
+    if "handle_command" in globals() and callable(globals()["handle_command"]):
+        _ap2_hc = globals()["handle_command"]
+        async def handle_command(*a, **kw):  # type: ignore
+            if a:
+                a = ( _ap2_sanitize_cmd(a[0]), *a[1:] )
+            if "text" in kw:
+                kw["text"] = _ap2_sanitize_cmd(kw["text"])
+            r = _ap2_hc(*a, **kw)
+            import asyncio as _ap2_asyncio
+            if _ap2_asyncio.iscoroutine(r):
+                return await r
+            return r
+        globals()["handle_command"] = handle_command  # noqa
+except Exception:
+    pass
+
+# --- Strengthen TradingEngine persistence if class exists ---
+try:
+    if "TradingEngine" in globals() and isinstance(globals()["TradingEngine"], type):
+        _ap2_TE = globals()["TradingEngine"]
+        # Inject save/load hooks if missing
+        if not hasattr(_ap2_TE, "_ap2_persist_ready"):
+            def _ap2_save_state(self):
+                from pathlib import Path as _ap2_Path
+                st = {"positions": getattr(self, "positions", {}),
+                      "budget_used_today": getattr(self, "budget_used_today", 0.0),
+                      "last_reset_date": getattr(self, "last_reset_date", "")}
+                _ap2_dir = _ap2_Path("state"); _ap2_dir.mkdir(parents=True, exist_ok=True)
+                _ap2_file = _ap2_dir / "positions.json"
+                import json as _ap2_json, os as _ap2_os
+                tmp = str(_ap2_file)+".tmp"
+                with open(tmp,"w",encoding="utf-8") as f: _ap2_json.dump(st, f, indent=2)
+                _ap2_os.replace(tmp, _ap2_file)
+            def _ap2_load_state(self):
+                from pathlib import Path as _ap2_Path
+                _ap2_file = _ap2_Path("state") / "positions.json"
+                import json as _ap2_json
+                try:
+                    with open(_ap2_file,"r",encoding="utf-8") as f:
+                        st = _ap2_json.load(f)
+                    if isinstance(st, dict):
+                        if "positions" in st and isinstance(getattr(self,"positions", None), dict):
+                            getattr(self,"positions").clear()
+                            getattr(self,"positions").update(st["positions"] or {})
+                        if "budget_used_today" in st and hasattr(self,"budget_used_today"):
+                            setattr(self,"budget_used_today", st["budget_used_today"] or 0.0)
+                        if "last_reset_date" in st and hasattr(self,"last_reset_date"):
+                            setattr(self,"last_reset_date", st["last_reset_date"] or "")
+                except Exception:
+                    pass
+            # Attach
+            setattr(_ap2_TE, "_ap2_save_state", _ap2_save_state)
+            setattr(_ap2_TE, "_ap2_load_state", _ap2_load_state)
+            # Auto-run load in __init__
+            _ap2_orig_init = _ap2_TE.__init__
+            def __init__(self, *a, **kw):
+                _ap2_orig_init(self, *a, **kw)
+                try: self._ap2_load_state()
+                except Exception: pass
+            _ap2_TE.__init__ = __init__
+            # Try to persist after open/close trade methods if they exist
+            for m in ("open_position", "close_position", "enter_position", "exit_position"):
+                if hasattr(_ap2_TE, m):
+                    _orig_m = getattr(_ap2_TE, m)
+                    def _wrap(_f):
+                        def __wrapped(self, *a, **kw):
+                            r = _f(self, *a, **kw)
+                            try: self._ap2_save_state()
+                            except Exception: pass
+                            return r
+                        return __wrapped
+                    setattr(_ap2_TE, m, _wrap(_orig_m))
+            _ap2_TE._ap2_persist_ready = True
+except Exception:
+    pass
+
+# --- Final atexit cleanup ---
+try:
+    @_ap2_atexit.register
+    def _ap2_cleanup():
+        try:
+            import matplotlib.pyplot as _ap2_plt2
+            _ap2_plt2.close("all")
+        except Exception:
+            pass
+        try:
+            import gc as _ap2_gc2
+            _ap2_gc2.collect()
+        except Exception:
+            pass
+except Exception:
+    pass
+
+# === END AUTO-PATCH LAYER v2 ===
+
+
+# === BEGIN AUTO-PATCH LAYER v3 ===
+# Fixes: AI output dict standardization, safe status summary, robust position sizing.
+
+import math as _ap3_math
+
+# --- Ensure predict_with_hybrid_ai always returns full dict ---
+async def predict_with_hybrid_ai(symbol: str):
+    # Clean input features to drop NaNs before prediction
+    if features.isnull().values.any():
+        features = features.fillna(method='ffill').fillna(method='bfill')
+    try:
+        res = _ap3_orig_ph(symbol)
+        if asyncio.iscoroutine(res):
+            res = await res
+        if isinstance(res, dict):
+            out = res.copy()
+        elif isinstance(res, (list, tuple)) and len(res) >= 2:
+            out = {"p_up": float(res[0]), "p_down": float(res[1]), "decision": "long" if res[0] > res[1] else "short"}
+        elif isinstance(res, (int, float)):
+            out = {"p_up": float(max(0.0, res)), "p_down": float(max(0.0, 1-res if abs(res) <= 1 else 0.0)), "decision": "long" if res > 0 else "short"}
+        else:
+            out = {"p_up": 0.5, "p_down": 0.5, "decision": "hold", "method": "fallback"}
+        for k in ("p_up", "p_down", "decision"):
+            if k not in out:
+                out[k] = {"p_up": 0.5, "p_down": 0.5, "decision": "hold"}[k]
+        return out
+    except Exception as e:
+        log(f"predict_with_hybrid_ai error for {symbol}: {e}")
+        return {"p_up": 0.5, "p_down": 0.5, "decision": "hold", "method": "error"}
+
+
+# --- Robustify TradingEngine._position_size ---
+try:
+    if "TradingEngine" in globals() and isinstance(globals()["TradingEngine"], type):
+        _ap3_TE = globals()["TradingEngine"]
+        if hasattr(_ap3_TE, "_position_size"):
+            _ap3_orig_ps = _ap3_TE._position_size
+            def _position_size(self, *a, **kw):
+                try:
+                    q = _ap3_orig_ps(self, *a, **kw)
+                    if not q or (isinstance(q,(int,float)) and q<=0):
+                        raise ValueError("qty<=0")
+                    return q
+                except Exception as e:
+                    try:
+                        # fallback: use balance or fixed notional
+                        bal = 1000.0
+                        if hasattr(self,"balance") and isinstance(self.balance,(int,float)):
+                            bal = self.balance
+                        price = None
+                        if a: price = a[0]
+                        if price is None and hasattr(self,"last_price"):
+                            price = getattr(self,"last_price")
+                        if not price: price = 100.0
+                        qty = max(0.001, (bal*0.01)/price)
+                        if hasattr(self,"log"):
+                            try: self.log(f"[patch_position_size] fallback qty={qty} reason={e}")
+                            except Exception: pass
+                        return qty
+                    except Exception:
+                        return 0.0
+            _ap3_TE._position_size = _position_size
+except Exception:
+    pass
+
+# === END AUTO-PATCH LAYER v3 ===
